@@ -14,6 +14,7 @@ from parcels._core.kernel import Kernel
 from parcels._core.particle import Particle, create_particle_data
 from parcels._core.particlesetview import ParticleSetView
 from parcels._core.statuscodes import StatusCode
+from parcels._core.utils.array_backend import array_namespace, import_cupy
 from parcels._core.utils.time import (
     TimeInterval,
     float_to_datelike,
@@ -145,6 +146,10 @@ class ParticleSet:
             if kwvar not in particle_variables:
                 raise RuntimeError(f"Particle class does not have Variable {kwvar}")
             self._data[kwvar][:] = kwval
+
+        if fieldset.uses_gpu_arrays:
+            cupy = import_cupy()
+            self._data = {name: cupy.asarray(values) for name, values in self._data.items()}
 
         self._kernel = None
 
@@ -321,6 +326,7 @@ class ParticleSet:
         compare_values = (
             np.array([compare_values]) if type(compare_values) not in [list, dict, np.ndarray] else compare_values
         )
+        compare_values = array_namespace(self._data[variable_name]).asarray(compare_values)
         return np.where(np.isin(self._data[variable_name], compare_values, invert=invert))[
             0
         ]  # TODO check if this can be faster with xarray indexing?
@@ -469,7 +475,7 @@ class ParticleSet:
 
 def _warn_outputdt_release_desync(outputdt: float, starttime: float, release_times: Iterable[float]):
     """Gives the user a warning if the release time isn't a multiple of outputdt."""
-    if outputdt and any((np.isfinite(t) and (t - starttime) % outputdt != 0) for t in release_times):
+    if outputdt and np.any(np.isfinite(release_times) & ((release_times - starttime) % outputdt != 0)):
         warnings.warn(
             "Some of the particles have a start time difference that is not a multiple of outputdt. "
             "This could cause the first output of some of the particles that start later "
@@ -536,9 +542,9 @@ def _get_simulation_start_and_end_times(
         raise ValueError("Either runtime or endtime must be provided.")
 
     if sign_dt == 1:
-        first_release_time = particle_release_times.min()
+        first_release_time = float(particle_release_times.min())
     else:
-        first_release_time = particle_release_times.max()
+        first_release_time = float(particle_release_times.max())
 
     if (time_interval is not None) and (endtime is not None):
         if type(endtime) != type(time_interval.left):  # noqa: E721

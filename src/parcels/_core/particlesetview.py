@@ -1,5 +1,6 @@
 import numpy as np
 
+from parcels._core.utils.array_backend import array_namespace, is_array
 from parcels._repr_utils import particlesetview_repr
 
 
@@ -22,7 +23,7 @@ class ParticleSetView:
             # user-facing semantics (e.g., `pset[0].time` should be a number).
             if isinstance(self._index, (int, np.integer)):
                 return self._data[name][self._index]
-            if isinstance(self._index, np.ndarray) and self._index.ndim == 0:
+            if is_array(self._index) and self._index.ndim == 0:
                 return self._data[name][int(self._index)]
             return ParticleSetViewArray(self._data, self._index, name)
         return self._data[name][self._index]
@@ -42,11 +43,12 @@ class ParticleSetView:
             index = index[0]
 
         base = self._index
+        xp = array_namespace(base)
         new_index = np.zeros_like(base, dtype=bool)
 
         # Boolean mask (could be local-length or global-length)
-        if isinstance(index, (np.ndarray, list)) and np.asarray(index).dtype == bool:
-            arr = np.asarray(index)
+        if _is_array_or_list(index) and xp.asarray(index).dtype == bool:
+            arr = xp.asarray(index)
             if arr.size == base.size:
                 # global mask
                 new_index = arr
@@ -61,14 +63,14 @@ class ParticleSetView:
         # Integer array/list, slice or single integer relative to the local view
         # (boolean masks were handled above). Normalize and map to global
         # particle indices for both boolean-base and integer-base `self._index`.
-        if isinstance(index, (np.ndarray, list, slice, int)):
+        if _is_array_or_list(index) or isinstance(index, (slice, int)):
             # convert list/ndarray to ndarray, keep slice/int as-is
-            idx = np.asarray(index) if isinstance(index, (np.ndarray, list)) else index
+            idx = xp.asarray(index) if _is_array_or_list(index) else index
             if base.dtype == bool:
                 particle_idxs = np.flatnonzero(base)
                 sel = particle_idxs[idx]
             else:
-                base_arr = np.asarray(base)
+                base_arr = xp.asarray(base)
                 sel = base_arr[idx]
             new_index[sel] = True
             return ParticleSetView(self._data, new_index, self._pclass)
@@ -84,14 +86,25 @@ class ParticleSetView:
         return len(self._index)
 
 
+def _is_array_or_list(index) -> bool:
+    return is_array(index) or isinstance(index, list)
+
+
 def _unwrap(other):
     """Return ndarray for ParticleSetViewArray or the value unchanged."""
     return other.__array__() if isinstance(other, ParticleSetViewArray) else other
 
 
+def _unwrap_nested(argument):
+    """Unwrap ParticleSetViewArrays that are passed directly or inside a list or tuple."""
+    if isinstance(argument, (list, tuple)):
+        return type(argument)(_unwrap_nested(item) for item in argument)
+    return _unwrap(argument)
+
+
 def _asarray(other):
-    """Return numpy array for ParticleSetViewArray, otherwise return argument."""
-    return np.asarray(other.__array__()) if isinstance(other, ParticleSetViewArray) else other
+    """Return the selected array for ParticleSetViewArray, otherwise return argument."""
+    return other.__array__() if isinstance(other, ParticleSetViewArray) else other
 
 
 class ParticleSetViewArray:
@@ -105,6 +118,14 @@ class ParticleSetViewArray:
     def __array__(self, dtype=None):
         arr = self._data[self._name][self._index]
         return arr.astype(dtype) if dtype is not None else arr
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        if any(isinstance(out, ParticleSetViewArray) for out in kwargs.get("out", ())):
+            return NotImplemented
+        return getattr(ufunc, method)(*(_unwrap(value) for value in inputs), **kwargs)
+
+    def __array_function__(self, func, types, args, kwargs):
+        return func(*_unwrap_nested(args), **{name: _unwrap_nested(value) for name, value in kwargs.items()})
 
     def __repr__(self):
         return repr(self.__array__())
@@ -120,11 +141,12 @@ class ParticleSetViewArray:
         base = self._index
         if subindex is None:
             return base
+        xp = array_namespace(base)
 
         # If subindex is a boolean array, support both local-length masks
         # (length == base.sum()) and global-length masks (length == base.size).
-        if isinstance(subindex, (np.ndarray, list)) and np.asarray(subindex).dtype == bool:
-            arr = np.asarray(subindex)
+        if _is_array_or_list(subindex) and xp.asarray(subindex).dtype == bool:
+            arr = xp.asarray(subindex)
             if arr.size == base.size:
                 # already a global mask
                 return arr
@@ -143,10 +165,10 @@ class ParticleSetViewArray:
             # map the first index (local selection) to global particle indices
             if base.dtype == bool:
                 particle_idxs = np.flatnonzero(base)
-                first_arr = np.asarray(first) if isinstance(first, (np.ndarray, list)) else first
+                first_arr = xp.asarray(first) if _is_array_or_list(first) else first
                 sel = particle_idxs[first_arr]
             else:
-                base_arr = np.asarray(base)
+                base_arr = xp.asarray(base)
                 sel = base_arr[first]
 
             # if rest contains a single int (e.g., column), return tuple index
@@ -164,7 +186,7 @@ class ParticleSetViewArray:
                 return rel
             # If subindex is an integer/array selection (relative to the
             # local view) map those to global integer indices.
-            arr = np.asarray(subindex)
+            arr = xp.asarray(subindex)
             if arr.dtype != bool:
                 particle_idxs = np.flatnonzero(base)
                 sel = particle_idxs[arr]
@@ -176,11 +198,11 @@ class ParticleSetViewArray:
             return global_mask
 
         # If base is an array of integer indices
-        base_arr = np.asarray(base)
+        base_arr = xp.asarray(base)
         try:
             return base_arr[subindex]
         except Exception:
-            return base_arr[np.asarray(subindex, dtype=bool)]
+            return base_arr[xp.asarray(subindex, dtype=bool)]
 
     def __getitem__(self, subindex):
         # Handle tuple indexing (e.g. [:, igrid]) by applying the tuple
@@ -265,32 +287,32 @@ class ParticleSetViewArray:
     # expressions like `mask = particles.gridID == gid` produce an ndarray
     # usable for indexing (rather than another ParticleSetViewArray).
     def __eq__(self, other):
-        left = np.asarray(self.__array__())
+        left = self.__array__()
         right = _asarray(other)
         return left == right
 
     def __ne__(self, other):
-        left = np.asarray(self.__array__())
+        left = self.__array__()
         right = _asarray(other)
         return left != right
 
     def __lt__(self, other):
-        left = np.asarray(self.__array__())
+        left = self.__array__()
         right = _asarray(other)
         return left < right
 
     def __le__(self, other):
-        left = np.asarray(self.__array__())
+        left = self.__array__()
         right = _asarray(other)
         return left <= right
 
     def __gt__(self, other):
-        left = np.asarray(self.__array__())
+        left = self.__array__()
         right = _asarray(other)
         return left > right
 
     def __ge__(self, other):
-        left = np.asarray(self.__array__())
+        left = self.__array__()
         right = _asarray(other)
         return left >= right
 

@@ -1,6 +1,6 @@
 import sys
 import warnings
-from typing import IO
+from typing import IO, Any
 
 import numpy as np
 
@@ -10,6 +10,7 @@ from parcels._core.index_search import (
     curvilinear_point_in_cell,
     uxgrid_point_in_cell,
 )
+from parcels._core.utils.array_backend import array_namespace, is_gpu_array
 from parcels._core.warnings import FieldSetWarning
 from parcels._python import isinstance_noimport
 from parcels._repr_utils import spatialhash_describe
@@ -220,6 +221,7 @@ class SpatialHash:
 
         # Generate the mapping from the hash indices to unstructured grid elements
         self._hash_table = self._initialize_hash_table()
+        self._gpu_hash_table: dict[str, Any] | None = None
 
     def _total_hash_entries(self, bitwidth):
         """Total number of (face, hash cell) pairs the hash table would hold at a given
@@ -377,6 +379,18 @@ class SpatialHash:
         }
         return hash_table
 
+    def _hash_table_like(self, like) -> dict[str, Any]:
+        """The hash table arrays, as arrays of the same kind (NumPy or CuPy) as ``like``.
+
+        The table is built on the host; its GPU copy is made on the first GPU query and reused.
+        """
+        if not is_gpu_array(like):
+            return self._hash_table
+        if self._gpu_hash_table is None:
+            xp = array_namespace(like)
+            self._gpu_hash_table = {name: xp.asarray(values) for name, values in self._hash_table.items()}
+        return self._gpu_hash_table
+
     def query(self, y, x):
         """
         Queries the hash table and finds the closes face in the source grid for each coordinate pair.
@@ -398,13 +412,15 @@ class SpatialHash:
             The local coordinates (xsi, eta) of the located face in the source grid for each query.
             If no face was found, (-1.0, -1.0)
         """
-        keys = self._hash_table["keys"]
-        starts = self._hash_table["starts"]
-        counts = self._hash_table["counts"]
-        faces = self._hash_table["faces"]
+        xp = array_namespace(y, x)
+        y = xp.asarray(y)
+        x = xp.asarray(x)
+        hash_table = self._hash_table_like(x)
+        keys = hash_table["keys"]
+        starts = hash_table["starts"]
+        counts = hash_table["counts"]
+        faces = hash_table["faces"]
 
-        y = np.asarray(y)
-        x = np.asarray(x)
         if self._source_grid.mesh.is_spherical():
             # Convert coords to Cartesian coordinates (x, y, z)
             lat = np.deg2rad(y)
@@ -442,8 +458,8 @@ class SpatialHash:
 
         # Pre-allocate i and j indices of the best match for each query
         # Default values to -1 (no match case)
-        j_best = np.full(num_queries, GRID_SEARCH_ERROR, dtype=np.int32)
-        i_best = np.full(num_queries, GRID_SEARCH_ERROR, dtype=np.int32)
+        j_best = xp.full(num_queries, GRID_SEARCH_ERROR, dtype=np.int32)
+        i_best = xp.full(num_queries, GRID_SEARCH_ERROR, dtype=np.int32)
 
         # How many matches each query has; hit_counts[i] is the number of hits for query i
         hit_counts = np.where(valid, counts[pos], 0).astype(np.int32)  # has shape (num_queries,)
@@ -451,7 +467,7 @@ class SpatialHash:
             return (
                 j_best.reshape(query_codes.shape),
                 i_best.reshape(query_codes.shape),
-                np.full((num_queries, self._coord_dim), -1.0, dtype=np.float32),
+                xp.full((num_queries, self._coord_dim), -1.0, dtype=np.float32),
             )
 
         # Now, for each query, we need to gather the candidate (j,i) indices from the hash table
@@ -462,7 +478,7 @@ class SpatialHash:
 
         # A quick lookup array that maps all candindates back to its query index
         q_index_for_candidate = np.repeat(
-            np.arange(num_queries, dtype=np.int32), hit_counts
+            xp.arange(num_queries, dtype=np.int32), hit_counts
         )  # shape (hit_counts.sum(),)
         # Map all candidates to positions in the hash table
         hash_positions = pos[q_index_for_candidate]  # shape (hit_counts.sum(),)
@@ -473,14 +489,16 @@ class SpatialHash:
         # hit_counts gives the number of candidates for each query
 
         # We need to build an array that gives the offset within each query's candidates
-        offsets = np.concatenate(([0], np.cumsum(hit_counts))).astype(np.int32)  # shape (num_queries+1,)
+        offsets = np.concatenate((xp.zeros(1, dtype=np.int32), np.cumsum(hit_counts))).astype(
+            np.int32
+        )  # shape (num_queries+1,)
         total = int(offsets[-1])  # total number of candidates across all queries
 
         # Now, for each candidate, we need a simple array that tells us its "local candidate id" within its query
         # This way, we can easily take the starts[pos[q_index_for_candidate]] and add this local id to get the absolute index
         # We calculate this by computing the "global candidate number" (0..total-1) and subtracting the offsets of the corresponding query
         # This gives us an array that goes from 0..hit_counts[i]-1 for each query i
-        intra = np.arange(total, dtype=np.int32) - np.repeat(offsets[:-1], hit_counts)  # shape (hit_counts.sum(),)
+        intra = xp.arange(total, dtype=np.int32) - np.repeat(offsets[:-1], hit_counts)  # shape (hit_counts.sum(),)
 
         # starts[pos[q_index_for_candidate]] + intra gives a list of positions in the hash table that we can
         # use to quickly gather the (i,j) pairs for each query
@@ -499,7 +517,7 @@ class SpatialHash:
         # For each query we perform a point in cell check.
         is_in_face, coordinates = self._point_in_cell(self._source_grid, y_rep, x_rep, j_all, i_all)
 
-        coords_best = np.full((num_queries, coordinates.shape[1]), -1.0, dtype=np.float32)
+        coords_best = xp.full((num_queries, coordinates.shape[1]), -1.0, dtype=np.float32)
 
         # For each query that has hits, we need to find the first candidate that was inside the face
         f_indices = np.flatnonzero(is_in_face)  # Indices of all faces that contained the point
@@ -556,7 +574,7 @@ def _dilate_bits(n):
         Input n:  b9 b8 b7 b6 b5 b4 b3 b2 b1 b0
         Output:   b9 0 0 b8 0 0 b7 0 0 ... b0 0 0
     """
-    n = np.asarray(n, dtype=np.uint32)
+    n = array_namespace(n).asarray(n, dtype=np.uint32)
 
     # Step 1: Keep only the lowest 10 bits of n
     # Mask = 0x3FF = binary 11 1111 1111
@@ -777,9 +795,10 @@ def quantize_coordinates(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth=1
         The quantized coordinates, each in range [0, 1023], same shape as the broadcasted input coordinates.
     """
     # Convert inputs to ndarray for consistent dtype/ufunc behavior.
-    x = np.asarray(x)
-    y = np.asarray(y)
-    z = np.asarray(z)
+    xp = array_namespace(x, y, z)
+    x = xp.asarray(x)
+    y = xp.asarray(y)
+    z = xp.asarray(z)
 
     # --- 1) Normalize each coordinate to [0, 1] over its bounding box. ---
     # Compute denominators once (avoid division by zero if bounds equal).
@@ -788,10 +807,11 @@ def quantize_coordinates(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth=1
     dz = zmax - zmin
 
     # Normalize to [0,1]; if a range is degenerate, map to 0 to avoid NaN/inf.
+    # np.not_equal returns a NumPy bool even for Python float bounds; CuPy's where rejects a Python bool condition.
     with np.errstate(invalid="ignore"):
-        xn = np.where(dx != 0, (x - xmin) / dx, 0.0)
-        yn = np.where(dy != 0, (y - ymin) / dy, 0.0)
-        zn = np.where(dz != 0, (z - zmin) / dz, 0.0)
+        xn = np.where(np.not_equal(dx, 0), (x - xmin) / dx, 0.0)
+        yn = np.where(np.not_equal(dy, 0), (y - ymin) / dy, 0.0)
+        zn = np.where(np.not_equal(dz, 0), (z - zmin) / dz, 0.0)
 
     # --- 2) Quantize to (0..bitwidth). ---
     # Multiply by bitwidth, round down, and clip to be safe against overshoot.
@@ -855,9 +875,10 @@ def _encode_morton3d(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth=1023)
     - Output is up to 30 bits returned as uint32.
     """
     # Convert inputs to ndarray for consistent dtype/ufunc behavior.
-    x = np.asarray(x)
-    y = np.asarray(y)
-    z = np.asarray(z)
+    xp = array_namespace(x, y, z)
+    x = xp.asarray(x)
+    y = xp.asarray(y)
+    z = xp.asarray(z)
 
     xq, yq, zq = quantize_coordinates(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth)
 
