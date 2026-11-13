@@ -1,7 +1,7 @@
 import warnings
 from collections.abc import Hashable, Sequence
 from functools import cached_property
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -13,6 +13,7 @@ import parcels._typing as ptyping
 from parcels._core.basegrid import BaseGrid
 from parcels._core.index_search import _search_1d_array, _search_1d_columns, _search_indices_curvilinear_2d
 from parcels._core.mesh import BaseMesh
+from parcels._core.utils.array_backend import array_namespace, is_gpu_array
 from parcels._core.warnings import FieldSetWarning
 from parcels._sgrid.accessor import _get_dim_to_axis_mapping, get_dim_position
 from parcels.interpolators._xinterpolators import _get_offsets_dictionary
@@ -350,23 +351,40 @@ class XGrid(BaseGrid):
             else:
                 return GridType.CurvilinearSGrid
 
+    def _coordinate_values(self, coordinate_name: str, like):
+        """Values of a grid coordinate as an array of the same kind (NumPy or CuPy) as ``like``."""
+        values = self._ds[coordinate_name].values
+        if not is_gpu_array(like):
+            return values
+        gpu_coordinates = self.__dict__.setdefault("_gpu_coordinates", {})
+        if coordinate_name not in gpu_coordinates:
+            gpu_coordinates[coordinate_name] = array_namespace(like).asarray(values)
+        return gpu_coordinates[coordinate_name]
+
+    def _node_coordinate_values(self, like) -> tuple[Any, Any]:
+        """Node longitudes and latitudes (``lon``, ``lat``) as arrays of the same kind (NumPy or CuPy) as ``like``."""
+        if not is_gpu_array(like):
+            return self.lon, self.lat
+        x_coordinate_name, y_coordinate_name = self.sgrid_metadata.node_coordinates
+        return self._coordinate_values(x_coordinate_name, like), self._coordinate_values(y_coordinate_name, like)
+
     def search(self, z, y, x, ei=None, ti=None, tau=None):
         ds = self._ds
         if self.sgrid_metadata.node_coordinates is not None:
             x_coordinate_name, y_coordinate_name = self.sgrid_metadata.node_coordinates
             x_coordinates = ds[x_coordinate_name]
-            y_coordinates = ds[y_coordinate_name]
 
+        xp = array_namespace(x)
         if "X" not in self.axes or x_coordinates is None or x_coordinates.ndim == 1:
             if "Y" in self.axes:
-                yi, eta = _search_1d_array(y_coordinates.values, y)
+                yi, eta = _search_1d_array(self._coordinate_values(y_coordinate_name, like=y), y)
             else:
-                yi, eta = np.zeros(y.shape, dtype=int), np.zeros(y.shape, dtype=float)
+                yi, eta = xp.zeros(y.shape, dtype=int), xp.zeros(y.shape, dtype=float)
 
             if "X" in self.axes:
-                xi, xsi = _search_1d_array(x_coordinates.values, x)
+                xi, xsi = _search_1d_array(self._coordinate_values(x_coordinate_name, like=x), x)
             else:
-                xi, xsi = np.zeros(x.shape, dtype=int), np.zeros(x.shape, dtype=float)
+                xi, xsi = xp.zeros(x.shape, dtype=int), xp.zeros(x.shape, dtype=float)
         elif x_coordinates is not None and x_coordinates.ndim == 2:
             yi, xi = None, None
             if ei is not None:
@@ -381,9 +399,9 @@ class XGrid(BaseGrid):
         if "Z" in self.axes and ds.depth.ndim == 4:
             zi, zeta = self._search_time_varying_depth(z, yi, xi, ti, tau)
         elif "Z" in self.axes:
-            zi, zeta = _search_1d_array(ds.depth.values, z)
+            zi, zeta = _search_1d_array(self._coordinate_values("depth", like=z), z)
         else:
-            zi, zeta = np.zeros(z.shape, dtype=int), np.zeros(z.shape, dtype=float)
+            zi, zeta = xp.zeros(z.shape, dtype=int), xp.zeros(z.shape, dtype=float)
 
         return {
             "Z": {"index": zi, "bcoord": zeta},

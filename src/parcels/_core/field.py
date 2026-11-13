@@ -14,6 +14,7 @@ from parcels._core.statuscodes import (
     AllParcelsErrorCodes,
     StatusCode,
 )
+from parcels._core.utils.array_backend import array_namespace
 from parcels._core.utils.string import _assert_str_and_python_varname
 from parcels._core.uxgrid import UxGrid
 from parcels._core.warnings import FieldEvalWarning
@@ -177,6 +178,7 @@ class Field:
             _ei = None
         else:
             _ei = particles.ei[:, self.igrid]
+        t = np.atleast_1d(t)
         z = np.atleast_1d(z)
         y = np.atleast_1d(y)
         x = np.atleast_1d(x)
@@ -286,6 +288,7 @@ class VectorField:
             _ei = None
         else:
             _ei = particles.ei[:, self.igrid]
+        t = np.atleast_1d(t)
         z = np.atleast_1d(z)
         y = np.atleast_1d(y)
         x = np.atleast_1d(x)
@@ -366,7 +369,7 @@ def _update_particle_states_position(particles, grid_positions: dict):
 
 
 def _mask_outofbounds_values(grid_positions: dict, value):
-    mask = np.zeros(value.shape, dtype=bool)
+    mask = array_namespace(value).zeros(value.shape, dtype=bool)
     for dim in ["X", "Y", "Z", "FACE"]:
         if dim in grid_positions:
             mask[grid_positions[dim]["index"] < 0] = True

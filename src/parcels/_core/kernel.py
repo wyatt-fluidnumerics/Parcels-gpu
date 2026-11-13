@@ -203,7 +203,7 @@ class Kernel:
         pset._data["state"][:] = StatusCode.Success
         preserve_particle_dt = not hasattr(self.fieldset, "RK45_tol")
 
-        while (len(pset) > 0) and np.any(np.isin(pset.state, [StatusCode.Success, StatusCode.Repeat])):
+        while (len(pset) > 0) and np.any((pset.state == StatusCode.Success) | (pset.state == StatusCode.Repeat)):
             time_to_endtime = sign_dt * (endtime - pset.t)
 
             evaluate_particles = (pset.state == StatusCode.Success) & (time_to_endtime >= 0)
@@ -213,12 +213,15 @@ class Kernel:
             # adapt dt to end exactly on endtime
             pset.dt, dt_to_restore = _clip_dt_to_endtime(pset.dt, time_to_endtime, sign_dt)
 
+            # Handing a kernel the whole ParticleSet avoids a masked copy of every particle variable it touches
+            particles_to_evaluate = pset if np.all(evaluate_particles) else pset[evaluate_particles]
+
             # run kernels for all particles that need to be evaluated
             for f in self._kernels:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", FieldEvalWarning)
 
-                    f(pset[evaluate_particles], self._fieldset)
+                    f(particles_to_evaluate, self._fieldset)
 
                     # check for particles that have to be repeated
                     repeat_particles = pset.state == StatusCode.Repeat
@@ -232,7 +235,8 @@ class Kernel:
             if np.any(update_particles):
                 pset.dt, newly_clipped = _clip_dt_to_endtime(pset.dt, time_to_endtime, sign_dt)
                 dt_to_restore.extend(newly_clipped)
-                self._position_update(pset[update_particles], self._fieldset)
+                particles_to_update = pset if np.all(update_particles) else pset[update_particles]
+                self._position_update(particles_to_update, self._fieldset)
 
             # Set particle state for particles that reached endtime
             particles_endofloop = (pset.state == StatusCode.Success) & (pset.t == endtime)
