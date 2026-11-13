@@ -25,6 +25,7 @@ from parcels._repr_utils import fieldset_describe
 from parcels.interpolators import (
     XConstantField,
 )
+from parcels.interpolators._gpu_xinterpolators import gpu_counterpart
 
 if TYPE_CHECKING:
     import uxarray as ux
@@ -217,6 +218,40 @@ class FieldSet:
         for model in self.models:
             model.to_chunk_cached_arrays(max_cache_bytes=max_cache_bytes)
         return self
+
+    def to_gpu_arrays(self, *, max_levels: int | None = None):
+        """Hold field data on the GPU as CuPy arrays, so that particles are advected on the GPU.
+
+        Opt-in, and requires CuPy. Replaces each field variable's internal storage
+        with a :class:`~parcels._gpu_array.GpuArray`. Delegates to each underlying
+        model: NumPy-backed (eager) fields are copied to the GPU in full, dask-backed
+        fields with a leading ``time`` dimension keep a rolling window of time levels
+        on the GPU. A :class:`~parcels.ParticleSet` created from this FieldSet
+        afterwards holds its particle data on the GPU as well. Only structured (SGRID)
+        models are supported.
+
+        Parameters
+        ----------
+        max_levels : int, optional
+            Number of time levels kept on the GPU per dask-backed field. Defaults to
+            two, the levels bracketing the current time when all particles share a
+            clock. A sample that spans more levels makes the window grow to that span.
+
+        Returns
+        -------
+        FieldSet
+            ``self``, to allow chaining.
+        """
+        for model in self.models:
+            model.to_gpu_arrays(max_levels=max_levels)
+        for field in self.fields.values():
+            if isinstance(field, VectorField):
+                field.interp_method = gpu_counterpart(field.interp_method)
+        return self
+
+    @property
+    def uses_gpu_arrays(self) -> bool:
+        return any(model.uses_gpu_arrays for model in self.models)
 
     def add_constant_field(self, name: str, value):
         """Wrapper function to add a Field that is constant in space,

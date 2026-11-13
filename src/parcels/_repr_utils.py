@@ -12,6 +12,7 @@ from dask.base import is_dask_collection
 
 from parcels._chunk_cached_array.core import ChunkCachedArray
 from parcels._core._windowed_array import WindowedArray
+from parcels._gpu_array.core import GpuArray
 from parcels._python import isinstance_noimport
 
 if TYPE_CHECKING:
@@ -224,6 +225,8 @@ def _field_backend(field: Field | VectorField) -> str | None:
             return "Dask"
         elif isinstance(field.data.variable._data, ChunkCachedArray):
             return "ChunkCachedArray"
+        elif isinstance(field.data.variable._data, GpuArray):
+            return "GpuArray"
         elif isinstance(field.data.data, np.ndarray):
             return "NumPy"
         else:
