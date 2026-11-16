@@ -203,7 +203,7 @@ class Kernel:
         pset._data["state"][:] = StatusCode.Success
         preserve_particle_dt = not hasattr(self.fieldset, "RK45_tol")
 
-        while (len(pset) > 0) and np.any(np.isin(pset.state, [StatusCode.Success, StatusCode.Repeat])):
+        while (len(pset) > 0) and np.any((pset.state == StatusCode.Success) | (pset.state == StatusCode.Repeat)):
             time_to_endtime = sign_dt * (endtime - pset.t)
 
             evaluate_particles = (pset.state == StatusCode.Success) & (time_to_endtime >= 0)

@@ -17,6 +17,7 @@ import parcels
 from parcels._core.mesh import BaseMesh
 from parcels._core.particle import ParticleClass
 from parcels._core.particlesetview import ParticleSetView
+from parcels._core.utils.array_backend import to_numpy
 from parcels._core.utils.time import timedelta_to_float
 from parcels._repr_utils import particlefile_repr
 from parcels._typing import PathLike
@@ -182,7 +183,7 @@ class ParticleFile:
             indices_to_write = _to_write_particles(particle_data, t)
 
         self._writer.write_table(
-            pa.table({v.name: pa.array(particle_data[v.name][indices_to_write]) for v in vars_to_write}),
+            pa.table({v.name: pa.array(to_numpy(particle_data[v.name][indices_to_write])) for v in vars_to_write}),
         )
 
     def close(self):
@@ -203,27 +204,16 @@ def _get_vars_to_write(particle: ParticleClass) -> list[Variable]:
 
 def _to_write_particles(particle_data, t):
     """Return the Particles that need to be written at time: if particle.t is between time-dt/2 and time+dt (/2)"""
+    particle_t = particle_data["t"]
+    half_dt = np.abs(particle_data["dt"] / 2)
+    # Comparisons with a non-finite particle t are discarded by the np.isfinite(particle_t) term
     return np.where(
         (
-            np.less_equal(
-                t - np.abs(particle_data["dt"] / 2),
-                particle_data["t"],
-                where=np.isfinite(particle_data["t"]),
-                out=None,
-            )
-            & np.greater_equal(
-                t + np.abs(particle_data["dt"] / 2),
-                particle_data["t"],
-                where=np.isfinite(particle_data["t"]),
-                out=None,
-            )  # check t - dt/2 <= particle_data["t"] <= t + dt/2
-            | (
-                (np.isnan(particle_data["dt"]))
-                & np.equal(t, particle_data["t"], where=np.isfinite(particle_data["t"]), out=None)
-            )  # or dt is NaN and t matches particle_data["t"]
+            ((t - half_dt <= particle_t) & (t + half_dt >= particle_t))  # check t - dt/2 <= particle_t <= t + dt/2
+            | (np.isnan(particle_data["dt"]) & (t == particle_t))  # or dt is NaN and t matches particle_t
         )
         & (np.isfinite(particle_data["particle_id"]))
-        & (np.isfinite(particle_data["t"]))
+        & (np.isfinite(particle_t))
     )[0]
 
 
