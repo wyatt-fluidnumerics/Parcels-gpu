@@ -14,7 +14,7 @@ from parcels._core.kernel import Kernel
 from parcels._core.particle import Particle, create_particle_data
 from parcels._core.particlesetview import ParticleSetView
 from parcels._core.statuscodes import StatusCode
-from parcels._core.utils.array_backend import array_namespace
+from parcels._core.utils.array_backend import array_namespace, import_cupy
 from parcels._core.utils.time import (
     TimeInterval,
     float_to_datelike,
@@ -146,6 +146,10 @@ class ParticleSet:
             if kwvar not in particle_variables:
                 raise RuntimeError(f"Particle class does not have Variable {kwvar}")
             self._data[kwvar][:] = kwval
+
+        if fieldset.uses_gpu_arrays:
+            cupy = import_cupy()
+            self._data = {name: cupy.asarray(values) for name, values in self._data.items()}
 
         self._kernel = None
 
