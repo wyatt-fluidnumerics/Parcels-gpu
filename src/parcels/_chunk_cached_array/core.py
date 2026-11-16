@@ -96,11 +96,10 @@ class ChunkCachedArray(ExplicitlyIndexedNDArrayMixin):
         ndim = len(self.array.chunks)
         assert len(indices) == ndim
 
-        # Step 0: Broadcast the index arrays and flatten them into a list of points,
-        # restoring the broadcast shape at the end.
-        broadcast = np.broadcast_arrays(*indices)
-        out_shape = broadcast[0].shape
-        indices = tuple(idx.ravel() for idx in broadcast)
+        # Step 0: The index arrays broadcast to a list of points. Their broadcast shape is
+        # restored at the end.
+        indices = tuple(np.asarray(idx) for idx in indices)
+        out_shape = np.broadcast_shapes(*(idx.shape for idx in indices))
         n_points = int(np.prod(out_shape))
         if n_points == 0:
             return np.empty(out_shape, dtype=self.array.dtype)
@@ -108,20 +107,19 @@ class ChunkCachedArray(ExplicitlyIndexedNDArrayMixin):
         # Step 1: Map global indices to chunk coords and local indices.
         # Normalize negative indices (e.g. -1 → last element) to positive,
         # matching standard numpy fancy-indexing semantics.
-        normalized = []
+        # Each dimension is mapped on its own index array, which can be much smaller
+        # than the list of points, and only the result is broadcast to the points.
+        chunk_ids = np.empty((ndim, n_points), dtype=np.intp)
+        local_indices = np.empty((ndim, n_points), dtype=np.intp)
         for d, idx in enumerate(indices):
             size = self.array.shape[d]
             out_of_bounds = (idx < -size) | (idx >= size)
             if out_of_bounds.any():
                 raise IndexError(f"index {idx[out_of_bounds][0]} is out of bounds for axis {d} with size {size}")
-            normalized.append(np.where(idx < 0, idx + size, idx))
-        indices = tuple(normalized)
-        chunk_ids = np.empty((ndim, n_points), dtype=np.intp)
-        local_indices = np.empty((ndim, n_points), dtype=np.intp)
-        for d in range(ndim):
-            cid = np.searchsorted(self._boundaries[d], indices[d], side="right") - 1
-            chunk_ids[d] = cid
-            local_indices[d] = indices[d] - self._boundaries[d][cid]
+            idx = np.where(idx < 0, idx + size, idx)
+            cid = np.searchsorted(self._boundaries[d], idx, side="right") - 1
+            chunk_ids[d] = np.broadcast_to(cid, out_shape).reshape(-1)
+            local_indices[d] = np.broadcast_to(idx - self._boundaries[d][cid], out_shape).reshape(-1)
 
         # Step 2: Group points by chunk using a structured array for vectorized grouping.
         # Encode each point's chunk coords as a single int for fast grouping.
