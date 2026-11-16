@@ -1,7 +1,5 @@
 """GPU-versus-CPU tests of curvilinear grids and C-grid interpolation. They need CuPy and a GPU, and are skipped otherwise."""
 
-import warnings
-from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,9 +22,7 @@ from parcels.interpolators import (
     XLinearInvdistLandTracer,
     XNearest,
     XPartialslip,
-    _gpu_xinterpolators,
 )
-from parcels.interpolators._gpu_xinterpolators import GpuCGrid_Tracer, GpuCGrid_Velocity, gpu_counterpart
 from parcels.kernels import AdvectionRK2, AdvectionRK4_3D
 
 cupy = pytest.importorskip("cupy")
@@ -376,11 +372,9 @@ def test_populate_indices_matches_cpu(mesh):
 def test_curvilinear_eval_matches_cpu(mesh, grid_type):
     fieldsets = {on_gpu: curvilinear_fieldset(mesh, grid_type, on_gpu=on_gpu) for on_gpu in (False, True)}
     if grid_type == "C":
-        assert type(fieldsets[True].UV.interp_method) is GpuCGrid_Velocity
-        assert type(fieldsets[True].UVW.interp_method) is GpuCGrid_Velocity
-        fieldsets[False].T.interp_method = CGrid_Tracer()
-        fieldsets[True].T.interp_method = gpu_counterpart(CGrid_Tracer())
-        assert type(fieldsets[True].T.interp_method) is GpuCGrid_Tracer
+        assert isinstance(fieldsets[True].UVW.interp_method, CGrid_Velocity)
+        for fieldset in fieldsets.values():
+            fieldset.T.interp_method = CGrid_Tracer()
     t, z, y, x = sample_points(mesh)
     points_gpu = to_gpu(t, z, y, x)
 
@@ -403,8 +397,6 @@ def test_rectilinear_cgrid_eval_matches_cpu(mesh):
         fieldset = parcels.FieldSet.from_sgrid_conventions(peninsula_dataset(grid_type="C", mesh_str=mesh))
         fieldset.P.interp_method = CGrid_Tracer()
         fieldsets[on_gpu] = fieldset.to_gpu_arrays() if on_gpu else fieldset
-    assert type(fieldsets[True].UV.interp_method) is GpuCGrid_Velocity
-    assert type(fieldsets[True].P.interp_method) is GpuCGrid_Tracer
     rng = np.random.default_rng(3)
     domain_scale = 1.0 / 1852.0 / 60.0 if mesh == "spherical" else 1.0
     x = rng.uniform(0.0, 1.0e5, 300) * domain_scale
@@ -449,133 +441,36 @@ def test_scalar_interpolation_matches_cpu(mesh, interpolator):
     assert_values_match(eval_including_outside_points(fieldsets[True].T, *to_gpu(t, z, y, x)), temperature_cpu)
 
 
-# ------------------------------------------------------------------------------------------------
-# Fused C-grid kernels against the generic corner gather, both on the GPU
-# ------------------------------------------------------------------------------------------------
-@pytest.fixture
-def fused_cgrid_kernel_calls(monkeypatch) -> Counter:
-    """Counts the calls the GPU C-grid interpolators make to their fused kernels."""
-    calls = Counter()
-    for name in ("sample_cgrid_horizontal_velocity", "sample_cgrid_vertical_velocity", "sample_cgrid_tracer"):
-        original = getattr(_gpu_xinterpolators, name)
-
-        def counted(*args, _name=name, _original=original, **kwargs):
-            calls[_name] += 1
-            return _original(*args, **kwargs)
-
-        monkeypatch.setattr(_gpu_xinterpolators, name, counted)
-    return calls
-
-
-def gpu_cgrid_fieldset(
-    mesh: str, rectilinear: bool, paddings: FacePaddings, chunked: bool, max_levels: int | None = None
-) -> parcels.FieldSet:
-    """C-grid fieldset on the GPU whose T is interpolated with ``CGrid_Tracer``; dask-backed (time-windowed) if chunked."""
-    if rectilinear:
-        ds = rectilinear_cgrid_dataset(mesh, paddings)
-    else:
-        ds = curvilinear_dataset(mesh, "C", paddings=paddings)
-    if chunked:
-        ds = ds.chunk({"time": 1})
-    fieldset = parcels.FieldSet.from_sgrid_conventions(ds, mesh=MESHES[mesh])
-    fieldset.T.interp_method = CGrid_Tracer()
-    return fieldset.to_gpu_arrays(max_levels=max_levels)
-
-
-def eval_cgrid_fields(fieldset: parcels.FieldSet, points: tuple, fused: bool) -> dict[str, object]:
-    """UV, UVW and T at ``points``, with the fused GPU interpolators or with the CPU interpolators they extend."""
-    velocity_interpolator = GpuCGrid_Velocity if fused else CGrid_Velocity
-    tracer_interpolator = GpuCGrid_Tracer if fused else CGrid_Tracer
-    fieldset.UV.interp_method = velocity_interpolator()
-    fieldset.UVW.interp_method = velocity_interpolator()
-    fieldset.T.interp_method = tracer_interpolator()
-    values = {}
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FieldEvalWarning)
-        for vector_field_name in ("UV", "UVW"):
-            velocity = getattr(fieldset, vector_field_name).eval(*points)
-            for component_name, component in zip("uvw", velocity, strict=False):
-                values[f"{vector_field_name}.{component_name}"] = component
-        values["T"] = fieldset.T.eval(*points)
-    return values
-
-
-def assert_fused_matches_generic(fused: dict, generic: dict, context: str) -> None:
-    """Fused and generic values agree to float64 round-off, relative to the largest value of each."""
-    for name, generic_values in generic.items():
-        generic_values = to_numpy(generic_values)
-        assert is_gpu_array(fused[name]), name
-        np.testing.assert_allclose(
-            to_numpy(fused[name]),
-            generic_values,
-            rtol=1e-12,
-            atol=1e-12 * np.max(np.abs(generic_values)),
-            err_msg=f"{name}, {context}",
-        )
-
-
 @pytest.mark.parametrize("chunked", [False, True], ids=["numpy", "dask"])
 @pytest.mark.parametrize("paddings", [NEMO_PADDINGS, MIXED_PADDINGS], ids=["nemo_paddings", "mixed_paddings"])
 @pytest.mark.parametrize("rectilinear", [False, True], ids=["curvilinear", "rectilinear"])
 @pytest.mark.parametrize("mesh", ["spherical", "flat"])
-def test_fused_cgrid_interpolation_matches_generic_gpu_path(
-    mesh, rectilinear, paddings, chunked, fused_cgrid_kernel_calls
-):
-    """The fused C-grid interpolators against the interpolators they extend, run on the same GPU data.
+def test_cgrid_eval_matches_cpu_for_every_staggering(mesh, rectilinear, paddings, chunked):
+    """C-grid velocity and tracer sampling where U, V, W and T have different shapes and offsets."""
+    fieldsets = {}
+    for on_gpu in (False, True):
+        ds = (
+            rectilinear_cgrid_dataset(mesh, paddings)
+            if rectilinear
+            else curvilinear_dataset(mesh, "C", paddings=paddings)
+        )
+        if chunked and on_gpu:
+            ds = ds.chunk({"time": 1})
+        fieldset = parcels.FieldSet.from_sgrid_conventions(ds, mesh=MESHES[mesh])
+        fieldset.T.interp_method = CGrid_Tracer()
+        fieldsets[on_gpu] = fieldset.to_gpu_arrays() if on_gpu else fieldset
 
-    The particles include some outside the grid horizontally and vertically, some on the first time
-    level (tau == 0), on their own and mixed with others, and some on an interior time level (tau == 1).
-    With mixed paddings U, V, W and T all differ in shape. With dask-backed data each field keeps its own
-    window of three time levels on the GPU, which every batch of particles fits in, and the levels sit in
-    other slots for U than for the other fields.
-    """
-    fieldset = gpu_cgrid_fieldset(mesh, rectilinear, paddings, chunked, max_levels=3 if chunked else None)
-    assert type(fieldset.UV.interp_method) is GpuCGrid_Velocity
-    assert type(fieldset.UVW.interp_method) is GpuCGrid_Velocity
-    assert type(fieldset.T.interp_method) is GpuCGrid_Tracer
-
-    rng = np.random.default_rng(5)
-    t, z, y, x = sample_points(mesh, npoints=300, seed=5, rectilinear=rectilinear)
-    z[:10] = -10.0
-    z[10:20] = 400.0
-    time_level_spacing_s = TIME_LEVEL_SPACING_HOURS * 3600.0
-    on_and_between_first_levels_t = rng.uniform(0.0, 1.0, t.size) * time_level_spacing_s
-    on_and_between_first_levels_t[::3] = 0.0
-    on_and_between_first_levels_t[1::3] = time_level_spacing_s
-    time_batches = [
-        ("between levels 3 and 4", rng.uniform(3.0, 4.0, t.size) * time_level_spacing_s),
-        ("on the first level", np.zeros_like(t)),
-        ("on and between levels 0 and 1", on_and_between_first_levels_t),
-        ("between levels 1 and 3", rng.uniform(1.0, 3.0, t.size) * time_level_spacing_s),
-        ("one time for all", np.array([1.5 * time_level_spacing_s])),
-    ]
-    if chunked:
-        # With U's window holding levels 2 and 3, loading levels 3 and 4 puts them in other slots for U than for V.
-        fieldset.U.eval(*to_gpu(np.array([2.5 * time_level_spacing_s]), z[100:101], y[100:101], x[100:101]))
-    else:
-        time_batches.append(("anywhere", t))
-
-    for batch_name, batch_t in time_batches:
-        points = to_gpu(batch_t, z, y, x)
-        fused = eval_cgrid_fields(fieldset, points, fused=True)
-        generic = eval_cgrid_fields(fieldset, points, fused=False)
-        assert_fused_matches_generic(fused, generic, f"particles {batch_name}")
-    n_batches = len(time_batches)
-    assert fused_cgrid_kernel_calls == {
-        "sample_cgrid_horizontal_velocity": 2 * n_batches,
-        "sample_cgrid_vertical_velocity": n_batches,
-        "sample_cgrid_tracer": n_batches,
-    }
-
-
-def test_fused_cgrid_interpolation_matches_generic_gpu_path_when_time_window_grows():
-    """Particles spread over all five time levels make each field's two-level window grow to five."""
-    fieldset = gpu_cgrid_fieldset("flat", rectilinear=True, paddings=NEMO_PADDINGS, chunked=True)
-    t, z, y, x = sample_points("flat", npoints=300, seed=5, rectilinear=True)
-    points = to_gpu(t, z, y, x)
-    fused = eval_cgrid_fields(fieldset, points, fused=True)
-    generic = eval_cgrid_fields(fieldset, points, fused=False)
-    assert_fused_matches_generic(fused, generic, "particles anywhere")
+    t, z, y, x = sample_points(mesh, rectilinear=rectilinear)
+    points_gpu = to_gpu(t, z, y, x)
+    for vector_field_name in ("UV", "UVW"):
+        velocity_cpu = eval_including_outside_points(getattr(fieldsets[False], vector_field_name), t, z, y, x)
+        velocity_gpu = eval_including_outside_points(getattr(fieldsets[True], vector_field_name), *points_gpu)
+        for component_gpu, component_cpu in zip(velocity_gpu, velocity_cpu, strict=True):
+            assert_values_match(component_gpu, component_cpu)
+    assert_values_match(
+        eval_including_outside_points(fieldsets[True].T, *points_gpu),
+        eval_including_outside_points(fieldsets[False].T, t, z, y, x),
+    )
 
 
 # ------------------------------------------------------------------------------------------------
@@ -594,8 +489,6 @@ def test_cgrid_rk2_advection_matches_cpu(mesh):
     psets = {}
     for on_gpu in (False, True):
         fieldset = curvilinear_fieldset(mesh, "C", on_gpu=on_gpu)
-        if on_gpu:
-            assert type(fieldset.UV.interp_method) is GpuCGrid_Velocity
         pset = parcels.ParticleSet(fieldset, x=x, y=y, z=z)
         pset.execute(
             [AdvectionRK2, DeleteErroredParticles],
@@ -647,7 +540,6 @@ def test_nemo_3d_curvilinear_advection_matches_cpu():
         fieldset = parcels.FieldSet.from_sgrid_conventions(ds)
         if on_gpu:
             fieldset.to_gpu_arrays()
-            assert type(fieldset.UVW.interp_method) is GpuCGrid_Velocity
         pset = parcels.ParticleSet(fieldset, x=x, y=y, z=z)
         pset.execute(
             AdvectionRK4_3D,
@@ -679,7 +571,6 @@ def test_nemo_global_curvilinear_advection_matches_cpu():
     for on_gpu in (False, True):
         if on_gpu:
             fieldset.to_gpu_arrays()
-            assert type(fieldset.UV.interp_method) is GpuCGrid_Velocity
         pset = parcels.ParticleSet(fieldset, x=x, y=y)
         pset.execute(AdvectionRK2, runtime=np.timedelta64(160, "D"), dt=np.timedelta64(10, "D"), verbose_progress=False)
         psets[on_gpu] = pset

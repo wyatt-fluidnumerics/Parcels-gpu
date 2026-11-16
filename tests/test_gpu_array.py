@@ -1,7 +1,6 @@
 """Tests of the GpuArray backend. They need CuPy and a GPU, and are skipped otherwise."""
 
 import io
-import warnings
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -12,7 +11,7 @@ import parcels
 import parcels._sgrid as sgrid
 from parcels._core.mesh import FlatMesh
 from parcels._core.utils.array_backend import is_gpu_array, to_numpy
-from parcels._core.warnings import FieldEvalWarning, FieldSetWarning
+from parcels._core.warnings import FieldSetWarning
 from parcels._datasets.structured.generated import radial_rotation_dataset
 from parcels._gpu_array import GpuArray
 from parcels.kernels import AdvectionEE, AdvectionRK2, AdvectionRK4
@@ -391,99 +390,8 @@ def test_particles_added_on_gpu_stay_on_gpu():
 
 
 # ------------------------------------------------------------------------------------------------
-# Fused search and interpolation kernels against the array-at-a-time code
+# Reading time levels ahead
 # ------------------------------------------------------------------------------------------------
-@pytest.mark.parametrize("coordinate_dtype", [np.float32, np.float64])
-@pytest.mark.parametrize("position_dtype", [np.float32, np.float64])
-def test_fused_search_matches_host_search(coordinate_dtype, position_dtype):
-    from parcels._core.index_search import _search_1d_array
-
-    rng = np.random.default_rng(11)
-    coordinate = np.sort(rng.uniform(-50, 50, 37)).astype(coordinate_dtype)
-    inside = rng.uniform(coordinate[0], coordinate[-1], 500)
-    on_nodes = coordinate[[0, 1, 17, 35, 36]].astype(np.float64)
-    outside_and_nan = np.array([coordinate[0] - 1.0, coordinate[-1] + 1.0, np.nan, -np.inf, np.inf])
-    positions = np.concatenate([inside, on_nodes, outside_and_nan]).astype(position_dtype)
-
-    index_cpu, bcoord_cpu = _search_1d_array(coordinate, positions)
-    index_gpu, bcoord_gpu = _search_1d_array(cupy.asarray(coordinate), cupy.asarray(positions))
-
-    assert index_gpu.dtype == index_cpu.dtype
-    assert bcoord_gpu.dtype == bcoord_cpu.dtype
-    np.testing.assert_array_equal(index_gpu.get(), index_cpu)
-    np.testing.assert_array_equal(bcoord_gpu.get(), bcoord_cpu)
-
-
-def test_to_gpu_arrays_installs_gpu_interpolators():
-    from parcels.interpolators import XLinear
-    from parcels.interpolators._gpu_xinterpolators import GpuXLinear, GpuXLinear_Velocity
-
-    class CustomInterpolator(XLinear):
-        pass
-
-    fieldset = rectilinear_fieldset(on_gpu=False)
-    fieldset.T.interp_method = CustomInterpolator()
-    fieldset.to_gpu_arrays()
-
-    assert type(fieldset.UV.interp_method) is GpuXLinear_Velocity
-    assert type(fieldset.U.interp_method) is GpuXLinear
-    assert type(fieldset.T.interp_method) is CustomInterpolator
-
-    fieldset.add_constant_field("Kh", 10.0)
-    assert type(fieldset.UV.interp_method) is GpuXLinear_Velocity
-
-
-@pytest.mark.parametrize("chunked", [False, True])
-def test_fused_sampling_matches_generic_gpu_sampling(chunked):
-    """The fused kernel against the corner gather through ``.isel()``, both on the GPU."""
-    from parcels.interpolators import XLinear, XLinear_Velocity
-
-    fused_fieldset = rectilinear_fieldset(on_gpu=True, chunked=chunked)
-    generic_fieldset = rectilinear_fieldset(on_gpu=True, chunked=chunked)
-    generic_fieldset.UV.interp_method = XLinear_Velocity()
-    generic_fieldset.T.interp_method = XLinear()
-
-    rng = np.random.default_rng(13)
-    npart = 400
-    x = rng.uniform(-170, 170, npart)
-    y = rng.uniform(-70, 70, npart)
-    z = rng.uniform(10, 900, npart)
-    z[:50] = 0.0  # on the first depth level, so zeta == 0
-    z[50:100] = 200.0  # on an interior depth level
-    x[100:110] = 181.0  # outside the grid
-    y[110:120] = -85.0
-    z[120:130] = 2000.0
-    time_levels_s = 6 * 3600.0
-    sampling_times = (
-        rng.uniform(0, time_levels_s, npart),
-        np.full(npart, time_levels_s),
-        np.array([0.5 * time_levels_s]),
-        rng.uniform(0, 3 * time_levels_s, npart),  # spread over every time level, so a two-level window has to grow
-    )
-    for t in sampling_times:
-        points = [cupy.asarray(values) for values in (t, z, y, x)]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FieldEvalWarning)
-            fused_velocity = fused_fieldset.UV.eval(*points)
-            generic_velocity = generic_fieldset.UV.eval(*points)
-            fused_temperature = fused_fieldset.T.eval(*points)
-            generic_temperature = generic_fieldset.T.eval(*points)
-        for fused, generic in zip(fused_velocity, generic_velocity, strict=True):
-            np.testing.assert_allclose(fused.get(), generic.get(), rtol=1e-12, atol=1e-18)
-        np.testing.assert_allclose(fused_temperature.get(), generic_temperature.get(), rtol=1e-12)
-
-
-def test_fused_sampling_keeps_both_time_levels_resident():
-    """A run that stays between two time levels loads each of them once."""
-    fieldset = rectilinear_fieldset(on_gpu=True, chunked=True)
-    pset = seeded_particleset(fieldset, npart=50)
-    pset.execute(AdvectionRK2, runtime=np.timedelta64(5, "h"), dt=np.timedelta64(30, "m"), verbose_progress=False)
-    for name in ("U", "V"):
-        gpu_array = fieldset.models[0].data.variables[name]._data
-        assert gpu_array.loads == 2
-        assert gpu_array.levels_on_gpu == [0, 1]
-
-
 @pytest.mark.parametrize("dt_sign", [1, -1])
 def test_prefetched_levels_are_used_and_change_nothing(dt_sign, monkeypatch):
     """A run crossing every time level, with and without reading ahead, forward and backward."""
@@ -499,6 +407,9 @@ def test_prefetched_levels_are_used_and_change_nothing(dt_sign, monkeypatch):
         psets[prefetch] = pset
         gpu_array = fieldset.models[0].data.variables["U"]._data
         assert gpu_array.loads == 4
-        assert gpu_array.prefetch_hits == (2 if prefetch else 0)
+        # The forward run starts exactly on the first level and needs only that one at first, so
+        # every later level arrives prefetched. The backward run starts between two levels.
+        expected_hits = 3 if dt_sign == 1 else 2
+        assert gpu_array.prefetch_hits == (expected_hits if prefetch else 0)
     for variable in ("x", "y", "z", "t"):
         np.testing.assert_array_equal(getattr(psets[True], variable).get(), getattr(psets[False], variable).get())
