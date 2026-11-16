@@ -141,6 +141,24 @@ def _place_fieldset_on_device(fieldset: parcels.FieldSet, device: str) -> parcel
     return fieldset.to_gpu_arrays()
 
 
+def use_generic_gpu_paths(fieldset: parcels.FieldSet, interpolators: bool, search: bool) -> None:
+    """Switch a GPU fieldset back to the array-at-a-time code, to measure what the fused kernels are worth.
+
+    ``interpolators`` puts the pre-built interpolators back in place of their GPU counterparts, so
+    fields are sampled through ``.isel()``. ``search`` makes the 1D search take the NumPy-style path.
+    """
+    if interpolators:
+        for field in fieldset.fields.values():
+            for base_class in type(field.interp_method).__mro__[1:]:
+                if base_class.__module__ == "parcels.interpolators._xinterpolators":
+                    field.interp_method = base_class()
+                    break
+    if search:
+        import parcels._core.index_search as index_search
+
+        index_search.is_gpu_array = lambda array: False
+
+
 def _windowed_array_load_counters(fieldset: parcels.FieldSet) -> tuple[int | None, int | None]:
     """Total (time levels loaded, bytes read) over all time-windowed field caches, if any."""
     field_arrays: list[object] = []
@@ -278,6 +296,8 @@ def run(args: argparse.Namespace) -> list[BenchmarkResult]:
     if kernel.__name__.endswith("_3D") and not case.has_vertical_velocity:
         raise ValueError(f"{args.kernel} needs a W field; only --case moi with --moi-include-w provides one.")
     case = dataclasses.replace(case, fieldset=_place_fieldset_on_device(case.fieldset, args.device))
+    if args.device == "gpu":
+        use_generic_gpu_paths(case.fieldset, interpolators=args.generic_interpolators, search=args.generic_search)
     fieldset_setup_s = time.perf_counter() - setup_start_s
     _assert_runtime_fits_in_field_time_span(case.fieldset, dt, args.nsteps + 1)
 
@@ -396,6 +416,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--results-file", type=Path, default=BENCHMARK_DIRECTORY / "results" / "results.jsonl")
     parser.add_argument("--cprofile-dir", type=Path, default=None, help="dump cProfile stats of each timed run here")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--generic-interpolators", action="store_true", help="gpu only: sample through .isel()")
+    parser.add_argument("--generic-search", action="store_true", help="gpu only: array-at-a-time 1D search")
     return parser.parse_args(argv)
 
 

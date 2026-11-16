@@ -23,8 +23,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
+import pyinstrument
 import xarray as xr
-from run_benchmark import DeleteErroredParticles
+from run_benchmark import DeleteErroredParticles, use_generic_gpu_paths
 
 import parcels
 import parcels.interpolators._xinterpolators as xinterpolators
@@ -96,6 +97,9 @@ class Stopwatch:
         return timed
 
 
+HOST_PROFILE_PATH: str | None = None
+GENERIC_INTERPOLATORS = False
+GENERIC_SEARCH = False
 FIELD_READ_STOPWATCH = Stopwatch()
 FIELD_WAIT_STOPWATCH = Stopwatch()
 OUTPUT_WRITE_STOPWATCH = Stopwatch()
@@ -128,7 +132,9 @@ def build_fieldset(device: str, backend: str) -> parcels.FieldSet:
     ds_sgrid = parcels.convert.copernicusmarine_to_sgrid(fields={"U": ds["utotal"], "V": ds["vtotal"]})
     fieldset = parcels.FieldSet.from_sgrid_conventions(ds_sgrid)
     if device == "gpu":
-        return fieldset.to_gpu_arrays()
+        fieldset.to_gpu_arrays()
+        use_generic_gpu_paths(fieldset, interpolators=GENERIC_INTERPOLATORS, search=GENERIC_SEARCH)
+        return fieldset
     if backend == "windowed":
         return fieldset.to_windowed_arrays()
     return fieldset.to_chunk_cached_arrays()
@@ -194,6 +200,10 @@ def run_simulation(
         fieldset = build_fieldset(device, backend)
         pset = parcels.ParticleSet(fieldset, x=seeds.lon_deg, y=seeds.lat_deg)
         output_file = ParticleFile(Path(output_directory) / "trajectories.parquet", outputdt=np.timedelta64(1, "h"))
+        # pyinstrument samples only the thread that starts it, so the background field readers stay out of the profile
+        profiler = pyinstrument.Profiler(interval=0.0005) if HOST_PROFILE_PATH else None
+        if profiler:
+            profiler.start()
         pset.execute(
             [parcels.kernels.AdvectionRK2, DeleteErroredParticles],
             runtime=nsteps * dt,
@@ -202,6 +212,9 @@ def run_simulation(
             verbose_progress=False,
         )
         synchronize(device)
+        if profiler:
+            profiler.stop()
+            Path(HOST_PROFILE_PATH).write_text(profiler.output_text(unicode=False, color=False, show_all=False))
         wall_s = time.perf_counter() - start
 
     remainder_s = wall_s - FIELD_READ_STOPWATCH.total_s - OUTPUT_WRITE_STOPWATCH.total_s
@@ -241,6 +254,9 @@ if __name__ == "__main__":
     parser.add_argument("--results-file", default="gpu_benchmarks/results/smoc_gather_comparison.jsonl")
     parser.add_argument("--output-parent-directory", default="gpu_benchmarks/logs")
     parser.add_argument("--no-prefetch", action="store_true", help="gpu only: do not read the next time level ahead")
+    parser.add_argument("--generic-interpolators", action="store_true", help="gpu only: sample through .isel()")
+    parser.add_argument("--generic-search", action="store_true", help="gpu only: array-at-a-time 1D search")
+    parser.add_argument("--host-profile", default=None, help="write a pyinstrument text profile of the main thread during the last timed pset.execute here")
     args = parser.parse_args()
 
     GpuArray.prefetch_next_level = not args.no_prefetch
@@ -256,6 +272,9 @@ if __name__ == "__main__":
         output_parent_directory=args.output_parent_directory,
     )
 
+    HOST_PROFILE_PATH = args.host_profile
+    GENERIC_INTERPOLATORS = args.generic_interpolators
+    GENERIC_SEARCH = args.generic_search
     for npart in args.npart:
         seeds = seed_ocean_particles(npart, seed=0)
         for variant in variants:
