@@ -23,6 +23,8 @@ from parcels._core.xgrid import (
     _transpose_xfield_data_to_tzyx,
     assert_all_field_dims_have_axis,
 )
+from parcels._gpu_array import GpuArray
+from parcels._gpu_array import wrap_dataset as wrap_dataset_in_gpu_arrays
 from parcels._logger import logger
 from parcels._python import NOTSET, NotSetType
 from parcels.interpolators import (
@@ -84,6 +86,43 @@ class ModelData(ABC):
         if windowed is not None and name in windowed:
             return windowed[name]
         return self.data[name]
+
+    @property
+    def uses_gpu_arrays(self) -> bool:
+        return any(isinstance(self.data.variables[name]._data, GpuArray) for name in self.scalar_field_names)
+
+    def to_gpu_arrays(self, *, max_levels: int | None = None) -> Self:
+        """Hold field data on the GPU.
+
+        Opt-in, and requires CuPy. Replaces each field variable's internal storage
+        with a :class:`~parcels._gpu_array.GpuArray`. Vectorized ``.isel()`` calls
+        then gather on the GPU and return CuPy arrays. NumPy-backed (eager) fields
+        are copied to the GPU in full. Dask-backed fields with a leading ``time``
+        dimension keep a rolling window of time levels on the GPU, each level
+        loaded once and evicted as the clock advances.
+
+        Coordinate variables are loaded eagerly into host memory. Only structured
+        (SGRID) models with a 1D vertical coordinate are supported.
+
+        Idempotent: re-invoking is safe — ``wrap_dataset`` skips variables whose
+        storage is already a ``GpuArray``.
+
+        Parameters
+        ----------
+        max_levels : int, optional
+            Number of time levels kept on the GPU per dask-backed field. Defaults
+            to two, the levels bracketing the current time when all particles
+            share a clock. A sample that spans more levels makes the window grow
+            to that span.
+        """
+        if not isinstance(self.grid, XGrid):
+            raise NotImplementedError("GPU arrays are currently only supported for structured (SGRID) models.")
+        if "depth" in self.data and self.data["depth"].ndim == 4:
+            raise NotImplementedError("GPU arrays do not support time-varying (4D) vertical coordinates yet.")
+        if self.__dict__.get("_windowed"):
+            raise ValueError("This model already uses windowed arrays; GPU arrays cannot be combined with them.")
+        self.data = wrap_dataset_in_gpu_arrays(self.data, self.scalar_field_names, max_levels=max_levels)
+        return self
 
     def to_windowed_arrays(self, *, max_levels: int | None = None) -> Self:
         """Wrap dask-backed field data in rolling time-window caches.
