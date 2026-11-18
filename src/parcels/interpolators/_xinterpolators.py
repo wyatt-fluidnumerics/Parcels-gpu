@@ -11,15 +11,17 @@ from dask import is_dask_collection
 import parcels._core.utils.interpolation as i_u
 import parcels._sgrid as sgrid
 import parcels._typing as ptyping
+from parcels._core._windowed_array import WindowedArray
+from parcels._core.utils.array_backend import array_namespace
 from parcels.interpolators._base import ScalarInterpolator, VectorInterpolator
 
 if TYPE_CHECKING:
-    from parcels._core._windowed_array import WindowedArray
     from parcels._core.field import Field, VectorField
     from parcels._core.xgrid import XGrid
 
 
 _CORNER_AXES: tuple[ptyping.XgcmAxisDirection, ...] = ("T", "Z", "Y", "X")
+_CORNER_DIMS: dict[ptyping.XgcmAxisDirection, str] = {axis: f"corner_{axis}" for axis in _CORNER_AXES}
 
 
 def _gather_corners(
@@ -32,8 +34,7 @@ def _gather_corners(
 
     The gather is the outer product over ``_CORNER_AXES``, with each axis
     contributing one or two levels and the particle index innermost. The local
-    variable ``shape`` states that layout, and is used both to build the index
-    arrays and to reshape the result.
+    variable ``shape`` states that layout.
 
     Parameters
     ----------
@@ -62,17 +63,33 @@ def _gather_corners(
     counts = tuple(len(levels[axis]) for axis in _CORNER_AXES)
     shape = (*counts, npart)
 
+    # Each indexed axis keeps its levels on an indexer dimension of its own. The backend
+    # then broadcasts the corner grid itself, so no index array of the full
+    # ``(*counts, npart)`` size is ever built.
     selection_dict = {}
+    indexed_corner_dims = []
     for i, axis in enumerate(_CORNER_AXES):
         if dims[axis] is not None and dims[axis] in data.dims:
-            stacked = np.stack(np.broadcast_arrays(*levels[axis]))  # (n_levels, npart)
-            # Put the level axis in slot i of the corner grid, spread it over the
-            # other slots, and flatten. This is the inverse of the reshape below.
-            other_slots = tuple(j for j in range(len(_CORNER_AXES)) if j != i)
-            in_slot_i = np.expand_dims(stacked, other_slots)
-            selection_dict[dims[axis]] = xr.DataArray(np.broadcast_to(in_slot_i, shape).reshape(-1), dims="points")
+            stacked = np.stack(np.broadcast_arrays(*levels[axis]))  # (n_levels, npart) or (n_levels, 1)
+            selection_dict[dims[axis]] = xr.Variable(
+                (_CORNER_DIMS[axis], "points"), np.broadcast_to(stacked, (counts[i], npart))
+            )
+            indexed_corner_dims.append(_CORNER_DIMS[axis])
 
-    return data.isel(selection_dict).data.reshape(shape)
+    # Indexing the variable keeps xarray from also indexing every dimension coordinate with the
+    # point arrays. A WindowedArray is not a variable-level array, it intercepts ``isel`` itself.
+    indexable = data if isinstance(data, WindowedArray) else data.variable
+    gathered = indexable.isel(selection_dict).transpose(*indexed_corner_dims, "points", ...).data
+
+    # Dimensions the field has but no axis indexes (size-1 mock dimensions) trail the points dimension.
+    gathered = gathered.reshape(gathered.shape[: len(indexed_corner_dims) + 1])
+    for i, axis in enumerate(_CORNER_AXES):
+        if _CORNER_DIMS[axis] not in indexed_corner_dims:
+            gathered = np.expand_dims(gathered, i)
+
+    # The copy lays the corners out contiguously with the particle index innermost, and makes the
+    # result writable where an unindexed axis repeats its corners.
+    return np.broadcast_to(gathered, shape).copy()
 
 
 def _get_corner_data_Agrid(
@@ -163,7 +180,8 @@ class XConstantField(ScalarInterpolator):
         field: Field,
     ):
         """Returning the single value of a Constant Field (with a size=(1,1,1,1) array)"""
-        return field.data[0, 0, 0, 0].values * np.ones_like(particle_positions["x"])
+        x = particle_positions["x"]
+        return array_namespace(x).asarray(field.data[0, 0, 0, 0].values) * np.ones_like(x)
 
 
 class XLinear_Velocity(VectorInterpolator):  # noqa:  N801
@@ -220,12 +238,14 @@ class CGrid_Velocity(VectorInterpolator):  # noqa:  N801
         tdim, zdim, ydim, xdim = U.shape[0], U.shape[1], U.shape[2], U.shape[3]
         lenT = 2 if np.any(tau > 0) else 1
 
-        if grid.lon.ndim == 1:
-            px = np.array([grid.lon[xi], grid.lon[xi + 1], grid.lon[xi + 1], grid.lon[xi]])
-            py = np.array([grid.lat[yi], grid.lat[yi], grid.lat[yi + 1], grid.lat[yi + 1]])
+        xp = array_namespace(xi)
+        lon, lat = grid._node_coordinate_values(like=xi)
+        if lon.ndim == 1:
+            px = xp.stack([lon[xi], lon[xi + 1], lon[xi + 1], lon[xi]])
+            py = xp.stack([lat[yi], lat[yi], lat[yi + 1], lat[yi + 1]])
         else:
-            px = np.array([grid.lon[yi, xi], grid.lon[yi, xi + 1], grid.lon[yi + 1, xi + 1], grid.lon[yi + 1, xi]])
-            py = np.array([grid.lat[yi, xi], grid.lat[yi, xi + 1], grid.lat[yi + 1, xi + 1], grid.lat[yi + 1, xi]])
+            px = xp.stack([lon[yi, xi], lon[yi, xi + 1], lon[yi + 1, xi + 1], lon[yi + 1, xi]])
+            py = xp.stack([lat[yi, xi], lat[yi, xi + 1], lat[yi + 1, xi + 1], lat[yi + 1, xi]])
 
         if grid.mesh.is_spherical():
             px = ((px + 180.0) % 360.0) - 180.0
@@ -609,8 +629,9 @@ class XLinearInvdistLandTracer(ScalarInterpolator):
 
             some_land = np.logical_and(nb_land > 0, nb_land < 4 * lenZ * lenT)
             if np.any(some_land):
-                i_grid = np.arange(2)[None, None, None, :, None]
-                j_grid = np.arange(2)[None, None, :, None, None]
+                xp = array_namespace(xsi)
+                i_grid = xp.arange(2)[None, None, None, :, None]
+                j_grid = xp.arange(2)[None, None, :, None, None]
                 eta_b = eta[None, None, None, None, :]
                 xsi_b = xsi[None, None, None, None, :]
 

@@ -10,6 +10,7 @@ import numpy as np
 
 from parcels._core.mesh import FlatMesh, SphericalMesh
 from parcels._core.spatialhash import SpatialHash
+from parcels._core.utils.array_backend import array_namespace
 
 if TYPE_CHECKING:
     import numpy as np
@@ -120,7 +121,8 @@ class BaseGrid(ABC):
             Raised if the method is not implemented for the current grid type.
         """
         dims = np.array([self.get_axis_dim(axis) for axis in self.axes], dtype=int)
-        indices = np.array([axis_indices[axis] for axis in self.axes], dtype=int)
+        xp = array_namespace(*axis_indices.values())
+        indices = [xp.asarray(axis_indices[axis]).astype(int) for axis in self.axes]
         return _ravel(dims, indices)
 
     def unravel_index(self, ei: int) -> dict[str, np.ndarray]:
@@ -247,7 +249,7 @@ def _unravel(dims, ei):
     """
     strides = np.cumprod(dims[::-1])[::-1]
 
-    indices = np.empty((len(dims), len(ei)), dtype=int)
+    indices = array_namespace(ei).empty((len(dims), len(ei)), dtype=int)
 
     for i in range(len(dims) - 1):
         indices[i, :] = ei // strides[i + 1]
