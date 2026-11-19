@@ -5,8 +5,6 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from parcels._core.index_search import GRID_SEARCH_ERROR, LEFT_OUT_OF_BOUNDS, RIGHT_OUT_OF_BOUNDS, _search_time_index
 from parcels._core.particleset import ParticleSet
 from parcels._core.particlesetview import ParticleSetView
@@ -14,7 +12,7 @@ from parcels._core.statuscodes import (
     AllParcelsErrorCodes,
     StatusCode,
 )
-from parcels._core.utils.array_backend import array_namespace
+from parcels._core.utils.array_backend import array_namespace, atleast_1d, device_of, flatnonzero
 from parcels._core.utils.string import _assert_str_and_python_varname
 from parcels._core.uxgrid import UxGrid
 from parcels._core.warnings import FieldEvalWarning
@@ -178,10 +176,10 @@ class Field:
             _ei = None
         else:
             _ei = particles.ei[:, self.igrid]
-        t = np.atleast_1d(t)
-        z = np.atleast_1d(z)
-        y = np.atleast_1d(y)
-        x = np.atleast_1d(x)
+        t = atleast_1d(t)
+        z = atleast_1d(z)
+        y = atleast_1d(y)
+        x = atleast_1d(x)
 
         particle_positions, grid_positions = _get_positions(self, t, z, y, x, particles, _ei)
 
@@ -291,10 +289,10 @@ class VectorField:
             _ei = None
         else:
             _ei = particles.ei[:, self.igrid]
-        t = np.atleast_1d(t)
-        z = np.atleast_1d(z)
-        y = np.atleast_1d(y)
-        x = np.atleast_1d(x)
+        t = atleast_1d(t)
+        z = atleast_1d(z)
+        y = atleast_1d(y)
+        x = atleast_1d(x)
 
         particle_positions, grid_positions = _get_positions(self.U, t, z, y, x, particles, _ei)
 
@@ -344,12 +342,13 @@ def _update_particle_states_position(particles, grid_positions: dict):
     if particles:
         for dim in ["X", "Y", "FACE"]:
             if dim in grid_positions:
-                particles.state = np.maximum(
-                    np.where(grid_positions[dim]["index"] == -1, StatusCode.ErrorOutOfBounds, particles.state),
+                xp = array_namespace(grid_positions[dim]["index"])
+                particles.state = xp.maximum(
+                    xp.where(grid_positions[dim]["index"] == -1, StatusCode.ErrorOutOfBounds, particles.state),
                     particles.state,
                 )
-                particles.state = np.maximum(
-                    np.where(
+                particles.state = xp.maximum(
+                    xp.where(
                         grid_positions[dim]["index"] == GRID_SEARCH_ERROR,
                         StatusCode.ErrorGridSearching,
                         particles.state,
@@ -357,14 +356,15 @@ def _update_particle_states_position(particles, grid_positions: dict):
                     particles.state,
                 )
         if "Z" in grid_positions:
-            particles.state = np.maximum(
-                np.where(
+            xp = array_namespace(grid_positions["Z"]["index"])
+            particles.state = xp.maximum(
+                xp.where(
                     grid_positions["Z"]["index"] == RIGHT_OUT_OF_BOUNDS, StatusCode.ErrorOutOfBounds, particles.state
                 ),
                 particles.state,
             )
-            particles.state = np.maximum(
-                np.where(
+            particles.state = xp.maximum(
+                xp.where(
                     grid_positions["Z"]["index"] == LEFT_OUT_OF_BOUNDS, StatusCode.ErrorThroughSurface, particles.state
                 ),
                 particles.state,
@@ -372,11 +372,12 @@ def _update_particle_states_position(particles, grid_positions: dict):
 
 
 def _mask_outofbounds_values(grid_positions: dict, value):
-    mask = array_namespace(value).zeros(value.shape, dtype=bool)
+    xp = array_namespace(value)
+    mask = xp.zeros(value.shape, dtype=xp.bool, device=device_of(value))
     for dim in ["X", "Y", "Z", "FACE"]:
         if dim in grid_positions:
             mask[grid_positions[dim]["index"] < 0] = True
-    if np.any(mask):
+    if xp.any(mask):
         warnings.warn(
             "Some interpolated values are out-of-bounds. These values are set to 0. Treat carefully.",
             FieldEvalWarning,
@@ -388,8 +389,9 @@ def _mask_outofbounds_values(grid_positions: dict, value):
 def _update_particle_states_interp_value(particles, value):
     """Update the particle states based on the interpolated value, but only if state is not an Error already."""
     if particles:
-        particles.state = np.maximum(
-            np.where(np.isnan(value), StatusCode.ErrorInterpolation, particles.state), particles.state
+        xp = array_namespace(value)
+        particles.state = xp.maximum(
+            xp.where(xp.isnan(value), StatusCode.ErrorInterpolation, particles.state), particles.state
         )
 
 
@@ -408,8 +410,9 @@ def _assert_same_time_interval(fields: Sequence[Field]) -> None:
 
 def _get_positions(field: Field, t, z, y, x, particles, _ei) -> tuple[dict, dict]:
     """Initialize and populate particle_positions and grid_positions dictionaries"""
-    if np.any(np.isnan(t)):
-        nan_indices = np.where(np.isnan(t))[0]
+    xp = array_namespace(t)
+    if xp.any(xp.isnan(t)):
+        nan_indices = flatnonzero(xp.isnan(t))
         raise ValueError(f"Time values for particles with indices {nan_indices} cannot be NaN.")
     particle_positions = {"t": t, "z": z, "y": y, "x": x}
     grid_positions = {}

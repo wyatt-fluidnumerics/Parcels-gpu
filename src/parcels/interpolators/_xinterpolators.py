@@ -12,7 +12,7 @@ import parcels._core.utils.interpolation as i_u
 import parcels._sgrid as sgrid
 import parcels._typing as ptyping
 from parcels._core._windowed_array import WindowedArray
-from parcels._core.utils.array_backend import array_namespace
+from parcels._core.utils.array_backend import array_namespace, asarray_like, deg2rad, device_of, is_array, isclose
 from parcels.interpolators._base import ScalarInterpolator, VectorInterpolator
 
 if TYPE_CHECKING:
@@ -36,6 +36,11 @@ def _gather_corners(
     contributing one or two levels and the particle index innermost. The local
     variable ``shape`` states that layout.
 
+    The index arrays go straight to the stored array when it can take them: a
+    Parcels backend through its ``_raw_vindex``, an eager array of an array
+    library through integer-array indexing. Lazily loaded data is gathered
+    through xarray's ``isel``.
+
     Parameters
     ----------
     data : xr.DataArray or WindowedArray
@@ -55,13 +60,44 @@ def _gather_corners(
 
     Returns
     -------
-    np.ndarray
+    array
         Array of shape ``(*counts, npart)``, where ``counts[i]`` is the number
-        of levels gathered on ``_CORNER_AXES[i]``.
+        of levels gathered on ``_CORNER_AXES[i]``. It is in the array library of
+        the stored data (NumPy when that is loaded lazily).
     """
     dims = {axis: ("time" if axis == "T" else axis_dim.get(axis)) for axis in _CORNER_AXES}
     counts = tuple(len(levels[axis]) for axis in _CORNER_AXES)
     shape = (*counts, npart)
+
+    storage = None if isinstance(data, WindowedArray) else data.variable._data
+    if hasattr(storage, "_raw_vindex") or (is_array(storage) and not is_dask_collection(storage)):
+        # One index array per stored dimension. Each indexed axis puts its levels in its own slot
+        # of the corner grid, so the indexing broadcasts the corner grid itself. Dimensions that no
+        # axis indexes (size-1 mock dimensions) are indexed at zero.
+        xp = array_namespace(*(level for axis in _CORNER_AXES for level in levels[axis]))
+        index_of_dim = {}
+        for i, axis in enumerate(_CORNER_AXES):
+            if dims[axis] is not None and dims[axis] in data.dims:
+                stacked = xp.stack(xp.broadcast_arrays(*levels[axis]))  # (n_levels, npart) or (n_levels, 1)
+                level_slot = (1,) * i + (counts[i],) + (1,) * (len(_CORNER_AXES) - 1 - i)
+                index_of_dim[dims[axis]] = xp.reshape(stacked, (*level_slot, -1))
+        indices = []
+        for dim in data.dims:
+            if dim in index_of_dim:
+                indices.append(index_of_dim[dim])
+            else:
+                indices.append(xp.zeros((1,) * len(shape), dtype=xp.int64, device=device_of(levels["T"][0])))
+
+        if hasattr(storage, "_raw_vindex"):
+            gathered = storage._raw_vindex(*indices)
+        else:
+            gathered = storage[tuple(indices)]
+
+        # Writing into a new array lays the corners out contiguously with the particle index
+        # innermost, and repeats the corners of an axis that was not indexed.
+        corners = array_namespace(gathered).empty(shape, dtype=gathered.dtype, device=device_of(gathered))
+        corners[...] = gathered
+        return corners
 
     # Each indexed axis keeps its levels on an indexer dimension of its own. The backend
     # then broadcasts the corner grid itself, so no index array of the full
@@ -104,11 +140,12 @@ def _get_corner_data_Agrid(
     axis_dim: dict[ptyping.XgridAxis, str],
 ) -> np.ndarray:
     """Helper function to get the corner data for a given A-grid field and position."""
+    xp = array_namespace(ti, zi, yi, xi)
     levels: dict[ptyping.XgcmAxisDirection, tuple[np.ndarray, ...]] = {
-        "T": (ti,) if lenT == 1 else (ti, np.clip(ti + 1, 0, data.shape[0] - 1)),
-        "Z": (zi,) if lenZ == 1 else (zi, np.clip(zi + 1, 0, data.shape[1] - 1)),
-        "Y": (yi, np.clip(yi + 1, 0, data.shape[2] - 1)),
-        "X": (xi, np.clip(xi + 1, 0, data.shape[3] - 1)),
+        "T": (ti,) if lenT == 1 else (ti, xp.clip(ti + 1, 0, data.shape[0] - 1)),
+        "Z": (zi,) if lenZ == 1 else (zi, xp.clip(zi + 1, 0, data.shape[1] - 1)),
+        "Y": (yi, xp.clip(yi + 1, 0, data.shape[2] - 1)),
+        "X": (xi, xp.clip(xi + 1, 0, data.shape[3] - 1)),
     }
     return _gather_corners(data, axis_dim, levels, npart)
 
@@ -144,22 +181,23 @@ class XLinear(ScalarInterpolator):
         axis_dim = field.grid.get_axis_dim_mapping(field.data.dims)
         data = field.data
 
-        lenT = 2 if np.any(tau > 0) else 1
-        lenZ = 2 if np.any(zeta > 0) else 1
+        xp = array_namespace(xsi)
+        lenT = 2 if xp.any(tau > 0) else 1
+        lenZ = 2 if xp.any(zeta > 0) else 1
 
-        corner_data = _get_corner_data_Agrid(data, ti, zi, yi, xi, lenT, lenZ, len(xsi), axis_dim)
+        corner_data = _get_corner_data_Agrid(data, ti, zi, yi, xi, lenT, lenZ, xsi.shape[0], axis_dim)
 
         if lenT == 2:
             tau = tau[np.newaxis, :]
-            corner_data = corner_data[0, :] * (1 - tau) + corner_data[1, :] * tau
+            corner_data = corner_data[0, ...] * (1 - tau) + corner_data[1, ...] * tau
         else:
-            corner_data = corner_data[0, :]
+            corner_data = corner_data[0, ...]
 
         if lenZ == 2:
             zeta = zeta[np.newaxis, :]
-            corner_data = corner_data[0, :] * (1 - zeta) + corner_data[1, :] * zeta
+            corner_data = corner_data[0, ...] * (1 - zeta) + corner_data[1, ...] * zeta
         else:
-            corner_data = corner_data[0, :]
+            corner_data = corner_data[0, ...]
 
         value = (
             (1 - xsi) * (1 - eta) * corner_data[0, 0, :]
@@ -181,7 +219,7 @@ class XConstantField(ScalarInterpolator):
     ):
         """Returning the single value of a Constant Field (with a size=(1,1,1,1) array)"""
         x = particle_positions["x"]
-        return array_namespace(x).asarray(field.data[0, 0, 0, 0].values) * np.ones_like(x)
+        return asarray_like(field.data[0, 0, 0, 0].values, like=x) * array_namespace(x).ones_like(x)
 
 
 class XLinear_Velocity(VectorInterpolator):  # noqa:  N801
@@ -197,14 +235,15 @@ class XLinear_Velocity(VectorInterpolator):  # noqa:  N801
         _xlinear = XLinear()
         u = _xlinear.interp(particle_positions, grid_positions, vectorfield.U)
         v = _xlinear.interp(particle_positions, grid_positions, vectorfield.V)
+        xp = array_namespace(u)
         if vectorfield.grid.mesh.is_spherical():
-            u /= vectorfield.grid.deg2m * np.cos(np.deg2rad(particle_positions["y"]))
+            u /= vectorfield.grid.deg2m * xp.cos(deg2rad(particle_positions["y"]))
             v /= vectorfield.grid.deg2m
 
         if vectorfield.W:
             w = _xlinear.interp(particle_positions, grid_positions, vectorfield.W)
         else:
-            w = np.zeros_like(u)
+            w = xp.zeros_like(u)
         return u, v, w
 
 
@@ -236,9 +275,9 @@ class CGrid_Velocity(VectorInterpolator):  # noqa:  N801
         grid = vectorfield.grid
         offsets = _get_offsets_dictionary(grid)
         tdim, zdim, ydim, xdim = U.shape[0], U.shape[1], U.shape[2], U.shape[3]
-        lenT = 2 if np.any(tau > 0) else 1
-
         xp = array_namespace(xi)
+        lenT = 2 if xp.any(tau > 0) else 1
+
         lon, lat = grid._node_coordinate_values(like=xi)
         if lon.ndim == 1:
             px = xp.stack([lon[xi], lon[xi + 1], lon[xi + 1], lon[xi]])
@@ -249,23 +288,47 @@ class CGrid_Velocity(VectorInterpolator):  # noqa:  N801
 
         if grid.mesh.is_spherical():
             px = ((px + 180.0) % 360.0) - 180.0
-            px[1:] = np.where(px[1:] - px[0] > 180, px[1:] - 360, px[1:])
-            px[1:] = np.where(-px[1:] + px[0] > 180, px[1:] + 360, px[1:])
+            px[1:, :] = xp.where(px[1:, :] - px[0, :] > 180, px[1:, :] - 360, px[1:, :])
+            px[1:, :] = xp.where(-px[1:, :] + px[0, :] > 180, px[1:, :] + 360, px[1:, :])
         c1 = i_u._geodetic_distance(
-            py[0], py[1], px[0], px[1], grid.mesh, np.einsum("ij,ji->i", i_u.phi2D_lin(0.0, xsi), py), grid.deg2m
+            py[0, :],
+            py[1, :],
+            px[0, :],
+            px[1, :],
+            grid.mesh,
+            xp.sum(i_u.phi2D_lin(0.0, xsi).T * py, axis=0),
+            grid.deg2m,
         )
         c2 = i_u._geodetic_distance(
-            py[1], py[2], px[1], px[2], grid.mesh, np.einsum("ij,ji->i", i_u.phi2D_lin(eta, 1.0), py), grid.deg2m
+            py[1, :],
+            py[2, :],
+            px[1, :],
+            px[2, :],
+            grid.mesh,
+            xp.sum(i_u.phi2D_lin(eta, 1.0).T * py, axis=0),
+            grid.deg2m,
         )
         c3 = i_u._geodetic_distance(
-            py[2], py[3], px[2], px[3], grid.mesh, np.einsum("ij,ji->i", i_u.phi2D_lin(1.0, xsi), py), grid.deg2m
+            py[2, :],
+            py[3, :],
+            px[2, :],
+            px[3, :],
+            grid.mesh,
+            xp.sum(i_u.phi2D_lin(1.0, xsi).T * py, axis=0),
+            grid.deg2m,
         )
         c4 = i_u._geodetic_distance(
-            py[3], py[0], px[3], px[0], grid.mesh, np.einsum("ij,ji->i", i_u.phi2D_lin(eta, 0.0), py), grid.deg2m
+            py[3, :],
+            py[0, :],
+            px[3, :],
+            px[0, :],
+            grid.mesh,
+            xp.sum(i_u.phi2D_lin(eta, 0.0).T * py, axis=0),
+            grid.deg2m,
         )
 
-        npart = len(xsi)
-        t_levels = (ti,) if lenT == 1 else (ti, np.clip(ti + 1, 0, tdim - 1))
+        npart = xsi.shape[0]
+        t_levels = (ti,) if lenT == 1 else (ti, xp.clip(ti + 1, 0, tdim - 1))
 
         def _compute_corner_data(data, y_levels, x_levels, z_levels=None) -> np.ndarray:
             """Gather the two bracketing face values and reduce over time if needed.
@@ -280,18 +343,18 @@ class CGrid_Velocity(VectorInterpolator):  # noqa:  N801
                 "X": x_levels,
             }
             axis_dim = grid.get_axis_dim_mapping(data.dims)
-            corner_data = _gather_corners(data, axis_dim, levels, npart).reshape(lenT, 2, npart)
+            corner_data = xp.reshape(_gather_corners(data, axis_dim, levels, npart), (lenT, 2, npart))
 
             if lenT == 2:
                 tau_full = tau[np.newaxis, :]
-                corner_data = corner_data[0, :] * (1 - tau_full) + corner_data[1, :] * tau_full
+                corner_data = corner_data[0, ...] * (1 - tau_full) + corner_data[1, ...] * tau_full
             else:
-                corner_data = corner_data[0, :]
+                corner_data = corner_data[0, ...]
             return corner_data
 
         # Compute U velocity: the two corners are the X faces
-        yi_o = np.clip(yi + offsets["Y"], 0, ydim - 1)
-        xi_1 = np.clip(xi + 1, 0, xdim - 1)
+        yi_o = xp.clip(yi + offsets["Y"], 0, ydim - 1)
+        xi_1 = xp.clip(xi + 1, 0, xdim - 1)
         corner_data = _compute_corner_data(U, y_levels=(yi_o,), x_levels=(xi, xi_1))
 
         U0 = corner_data[0, :] * c4
@@ -299,8 +362,8 @@ class CGrid_Velocity(VectorInterpolator):  # noqa:  N801
         Uvel = (1 - xsi) * U0 + xsi * U1
 
         # Compute V velocity: the two corners are the Y faces
-        yi_1 = np.clip(yi + 1, 0, ydim - 1)
-        xi_o = np.clip(xi + offsets["X"], 0, xdim - 1)
+        yi_1 = xp.clip(yi + 1, 0, ydim - 1)
+        xi_o = xp.clip(xi + offsets["X"], 0, xdim - 1)
         corner_data = _compute_corner_data(V, y_levels=(yi, yi_1), x_levels=(xi_o,))
 
         V0 = corner_data[0, :] * c1
@@ -313,23 +376,23 @@ class CGrid_Velocity(VectorInterpolator):  # noqa:  N801
             jac = i_u._compute_jacobian_determinant(py, px, eta, xsi)
 
         u = (
-            (-(1 - eta) * Uvel - (1 - xsi) * Vvel) * px[0]
-            + ((1 - eta) * Uvel - xsi * Vvel) * px[1]
-            + (eta * Uvel + xsi * Vvel) * px[2]
-            + (-eta * Uvel + (1 - xsi) * Vvel) * px[3]
+            (-(1 - eta) * Uvel - (1 - xsi) * Vvel) * px[0, :]
+            + ((1 - eta) * Uvel - xsi * Vvel) * px[1, :]
+            + (eta * Uvel + xsi * Vvel) * px[2, :]
+            + (-eta * Uvel + (1 - xsi) * Vvel) * px[3, :]
         ) / jac
         v = (
-            (-(1 - eta) * Uvel - (1 - xsi) * Vvel) * py[0]
-            + ((1 - eta) * Uvel - xsi * Vvel) * py[1]
-            + (eta * Uvel + xsi * Vvel) * py[2]
-            + (-eta * Uvel + (1 - xsi) * Vvel) * py[3]
+            (-(1 - eta) * Uvel - (1 - xsi) * Vvel) * py[0, :]
+            + ((1 - eta) * Uvel - xsi * Vvel) * py[1, :]
+            + (eta * Uvel + xsi * Vvel) * py[2, :]
+            + (-eta * Uvel + (1 - xsi) * Vvel) * py[3, :]
         ) / jac
         if is_dask_collection(u):
             u = u.compute()
             v = v.compute()
 
         if grid.mesh.is_spherical():
-            conversion = grid.deg2m * np.cos(np.deg2rad(particle_positions["y"]))
+            conversion = grid.deg2m * xp.cos(deg2rad(particle_positions["y"]))
             u /= conversion
             v /= conversion
 
@@ -337,17 +400,17 @@ class CGrid_Velocity(VectorInterpolator):  # noqa:  N801
             W = vectorfield.W.data
 
             # Compute W velocity: the two corners are the Z faces
-            yi_o = np.clip(yi + offsets["Y"], 0, ydim - 1)
-            xi_o = np.clip(xi + offsets["X"], 0, xdim - 1)
-            zi_0 = np.clip(zi + offsets["Z"], 0, zdim - 1)
-            zi_1 = np.clip(zi + offsets["Z"] + 1, 0, zdim - 1)
+            yi_o = xp.clip(yi + offsets["Y"], 0, ydim - 1)
+            xi_o = xp.clip(xi + offsets["X"], 0, xdim - 1)
+            zi_0 = xp.clip(zi + offsets["Z"], 0, zdim - 1)
+            zi_1 = xp.clip(zi + offsets["Z"] + 1, 0, zdim - 1)
             corner_data = _compute_corner_data(W, y_levels=(yi_o,), x_levels=(xi_o,), z_levels=(zi_0, zi_1))
 
             w = corner_data[0, :] * (1 - zeta) + corner_data[1, :] * zeta
             if is_dask_collection(w):
                 w = w.compute()
         else:
-            w = np.zeros_like(u)
+            w = xp.zeros_like(u)
 
         return (u, v, w)
 
@@ -379,21 +442,22 @@ class CGrid_Tracer(ScalarInterpolator):  # noqa:  N801
         axis_dim = field.grid.get_axis_dim_mapping(field.data.dims)
         data = field.data
 
+        xp = array_namespace(xi)
         offsets = _get_offsets_dictionary(field.grid)
-        zi = np.clip(zi + offsets["Z"], 0, data.shape[1] - 1)
-        yi = np.clip(yi + offsets["Y"], 0, data.shape[2] - 1)
-        xi = np.clip(xi + offsets["X"], 0, data.shape[3] - 1)
+        zi = xp.clip(zi + offsets["Z"], 0, data.shape[1] - 1)
+        yi = xp.clip(yi + offsets["Y"], 0, data.shape[2] - 1)
+        xi = xp.clip(xi + offsets["X"], 0, data.shape[3] - 1)
 
-        lenT = 2 if np.any(tau > 0) else 1
-        npart = len(xi)
+        lenT = 2 if xp.any(tau > 0) else 1
+        npart = xi.shape[0]
 
         levels = {
-            "T": (ti,) if lenT == 1 else (ti, np.clip(ti + 1, 0, data.shape[0] - 1)),
+            "T": (ti,) if lenT == 1 else (ti, xp.clip(ti + 1, 0, data.shape[0] - 1)),
             "Z": (zi,),
             "Y": (yi,),
             "X": (xi,),
         }
-        value = _gather_corners(data, axis_dim, levels, npart).reshape(lenT, npart)
+        value = xp.reshape(_gather_corners(data, axis_dim, levels, npart), (lenT, npart))
 
         if lenT == 2:
             value = value[0, :] * (1 - tau) + value[1, :] * tau
@@ -417,9 +481,10 @@ def _Spatialslip(
     ti, tau = grid_positions["T"]["index"], grid_positions["T"]["bcoord"]
 
     axis_dim = vectorfield.U.grid.get_axis_dim_mapping(vectorfield.U.data.dims)
-    lenT = 2 if np.any(tau > 0) else 1
-    lenZ = 2 if np.any(zeta > 0) else 1
-    npart = len(xsi)
+    xp = array_namespace(xsi)
+    lenT = 2 if xp.any(tau > 0) else 1
+    lenZ = 2 if xp.any(zeta > 0) else 1
+    npart = xsi.shape[0]
 
     _xlinear = XLinear()
     u = _xlinear.interp(particle_positions, grid_positions, vectorfield.U)
@@ -433,15 +498,16 @@ def _Spatialslip(
     if vectorfield.W:
         axis_dimW = vectorfield.W.grid.get_axis_dim_mapping(vectorfield.W.data.dims)
         corner_dataW = _get_corner_data_Agrid(vectorfield.W.data, ti, zi, yi, xi, lenT, lenZ, npart, axis_dimW)
+    zero = asarray_like(0.0, like=corner_dataU)
 
     def is_land(ti: int, zi: int, yi: int, xi: int):
         uval = corner_dataU[ti, zi, yi, xi, :]
         vval = corner_dataV[ti, zi, yi, xi, :]
         wval = None if corner_dataW is None else corner_dataW[ti, zi, yi, xi, :]
-        land_check = np.isclose(uval, 0.0) & np.isclose(vval, 0.0)
+        land_check = isclose(uval, zero) & isclose(vval, zero)
         if wval is not None:
-            land_check = land_check & np.isclose(wval, 0.0)
-        return np.where(land_check, True, False)
+            land_check = land_check & isclose(wval, zero)
+        return land_check
 
     if is_dask_collection(u):
         u = u.compute()
@@ -449,7 +515,7 @@ def _Spatialslip(
         if vectorfield.W:
             w = w.compute()
 
-    f_u = np.ones_like(xsi)
+    f_u = xp.ones_like(xsi)
     if lenZ == 1:
         land = is_land(0, 0, 0, 0) & is_land(0, 0, 0, 1) & (eta > 0)
     else:
@@ -468,9 +534,9 @@ def _Spatialslip(
 
     u = u * f_u
     if vectorfield.grid.mesh.is_spherical():
-        u /= 1852 * 60 * np.cos(np.deg2rad(particle_positions["y"]))
+        u /= 1852 * 60 * xp.cos(deg2rad(particle_positions["y"]))
 
-    f_v = np.ones_like(eta)
+    f_v = xp.ones_like(eta)
     if lenZ == 1:
         land = is_land(0, 0, 0, 0) & is_land(0, 0, 1, 0) & (xsi > 0)
     else:
@@ -492,7 +558,7 @@ def _Spatialslip(
         v /= 1852 * 60
 
     if vectorfield.W:
-        f_w = np.ones_like(zeta)
+        f_w = xp.ones_like(zeta)
         last_z = lenZ - 1
         land = (
             is_land(0, 0, 0, 0) & is_land(0, 0, 0, 1) & is_land(0, last_z, 0, 0) & is_land(0, last_z, 0, 1) & (eta > 0)
@@ -515,7 +581,7 @@ def _Spatialslip(
         f_w[land] = f_w[land] * (1 - b * xsi[land]) / (1 - xsi[land])
         w = w * f_w
     else:
-        w = np.zeros_like(u)
+        w = xp.zeros_like(u)
 
     return u, v, w
 
@@ -570,30 +636,31 @@ class XNearest(ScalarInterpolator):
         axis_dim = field.grid.get_axis_dim_mapping(field.data.dims)
         data = field.data
 
-        lenT = 2 if np.any(tau > 0) else 1
+        xp = array_namespace(xsi)
+        lenT = 2 if xp.any(tau > 0) else 1
 
         # Spatial coordinates: left if barycentric < 0.5, otherwise right
-        zi_1 = np.clip(zi + 1, 0, data.shape[1] - 1)
-        zi_full = np.where(zeta <= 0.5, zi, zi_1)
+        zi_1 = xp.clip(zi + 1, 0, data.shape[1] - 1)
+        zi_full = xp.where(zeta <= 0.5, zi, zi_1)
 
-        yi_1 = np.clip(yi + 1, 0, data.shape[2] - 1)
-        yi_full = np.where(eta <= 0.5, yi, yi_1)
+        yi_1 = xp.clip(yi + 1, 0, data.shape[2] - 1)
+        yi_full = xp.where(eta <= 0.5, yi, yi_1)
 
-        xi_1 = np.clip(xi + 1, 0, data.shape[3] - 1)
-        xi_full = np.where(xsi <= 0.5, xi, xi_1)
+        xi_1 = xp.clip(xi + 1, 0, data.shape[3] - 1)
+        xi_full = xp.where(xsi <= 0.5, xi, xi_1)
 
         levels: dict[ptyping.XgcmAxisDirection, tuple[np.ndarray, ...]] = {
-            "T": (ti,) if lenT == 1 else (ti, np.clip(ti + 1, 0, data.shape[0] - 1)),
+            "T": (ti,) if lenT == 1 else (ti, xp.clip(ti + 1, 0, data.shape[0] - 1)),
             "Z": (zi_full,),
             "Y": (yi_full,),
             "X": (xi_full,),
         }
-        corner_data = _gather_corners(data, axis_dim, levels, len(xsi))[:, 0, 0, 0]
+        corner_data = _gather_corners(data, axis_dim, levels, xsi.shape[0])[:, 0, 0, 0, :]
 
         if lenT == 2:
-            value = corner_data[0] * (1 - tau) + corner_data[1] * tau
+            value = corner_data[0, :] * (1 - tau) + corner_data[1, :] * tau
         else:
-            value = corner_data[0]
+            value = corner_data[0, :]
         return value.compute() if is_dask_collection(value) else value
 
 
@@ -615,23 +682,24 @@ class XLinearInvdistLandTracer(ScalarInterpolator):
         ti, tau = grid_positions["T"]["index"], grid_positions["T"]["bcoord"]
 
         axis_dim = field.grid.get_axis_dim_mapping(field.data.dims)
-        lenT = 2 if np.any(tau > 0) else 1
-        lenZ = 2 if np.any(zeta > 0) else 1
+        xp = array_namespace(xsi)
+        lenT = 2 if xp.any(tau > 0) else 1
+        lenZ = 2 if xp.any(zeta > 0) else 1
 
-        corner_data = _get_corner_data_Agrid(field.data, ti, zi, yi, xi, lenT, lenZ, len(xsi), axis_dim)
+        corner_data = _get_corner_data_Agrid(field.data, ti, zi, yi, xi, lenT, lenZ, xsi.shape[0], axis_dim)
 
-        land_mask = np.isclose(corner_data, 0.0)
-        nb_land = np.sum(land_mask, axis=(0, 1, 2, 3))
+        land_mask = isclose(corner_data, asarray_like(0.0, like=corner_data))
+        nb_land = xp.sum(xp.astype(land_mask, xp.int64), axis=(0, 1, 2, 3))
 
-        if np.any(nb_land):
+        if xp.any(nb_land):
             all_land_mask = nb_land == 4 * lenZ * lenT
             values[all_land_mask] = 0.0
 
-            some_land = np.logical_and(nb_land > 0, nb_land < 4 * lenZ * lenT)
-            if np.any(some_land):
-                xp = array_namespace(xsi)
-                i_grid = xp.arange(2)[None, None, None, :, None]
-                j_grid = xp.arange(2)[None, None, :, None, None]
+            some_land = xp.logical_and(nb_land > 0, nb_land < 4 * lenZ * lenT)
+            if xp.any(some_land):
+                # float64 keeps the distances in the precision NumPy gives bcoords minus integer offsets
+                i_grid = xp.arange(2, dtype=xp.float64, device=device_of(xsi))[None, None, None, :, None]
+                j_grid = xp.arange(2, dtype=xp.float64, device=device_of(xsi))[None, None, :, None, None]
                 eta_b = eta[None, None, None, None, :]
                 xsi_b = xsi[None, None, None, None, :]
 
@@ -640,19 +708,19 @@ class XLinearInvdistLandTracer(ScalarInterpolator):
                 valid_mask = ~land_mask
                 # Normal inverse-distance weighting
                 inv_dist = 1.0 / dist2
-                weighted = np.where(valid_mask, corner_data * inv_dist, 0.0)
+                weighted = xp.where(valid_mask, corner_data * inv_dist, 0.0)
 
-                val = np.sum(weighted, axis=(0, 1, 2, 3))
-                w_sum = np.sum(np.where(valid_mask, inv_dist, 0.0), axis=(0, 1, 2, 3))
+                val = xp.sum(weighted, axis=(0, 1, 2, 3))
+                w_sum = xp.sum(xp.where(valid_mask, inv_dist, 0.0), axis=(0, 1, 2, 3))
 
-                values[some_land] = val[some_land] / w_sum[some_land]
+                values[some_land] = xp.astype(val[some_land] / w_sum[some_land], values.dtype, copy=False)
 
                 # If a particle hits exactly one of the 8 corner points, extract it
                 exact_mask = (dist2 == 0) & valid_mask
-                exact_vals = np.sum(np.where(exact_mask, corner_data, 0.0), axis=(0, 1, 2, 3))
-                has_exact = np.any(exact_mask, axis=(0, 1, 2, 3))
+                exact_vals = xp.sum(xp.where(exact_mask, corner_data, 0.0), axis=(0, 1, 2, 3))
+                has_exact = xp.any(exact_mask, axis=(0, 1, 2, 3))
 
                 exact_particles = some_land & has_exact
-                values[exact_particles] = exact_vals[exact_particles]
+                values[exact_particles] = xp.astype(exact_vals[exact_particles], values.dtype, copy=False)
 
         return values.compute() if is_dask_collection(values) else values

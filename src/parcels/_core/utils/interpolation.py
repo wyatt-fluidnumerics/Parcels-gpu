@@ -1,11 +1,18 @@
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
 from parcels._core.mesh import BaseMesh
+from parcels._core.utils.array_backend import array_namespace, atleast_1d
 
 __all__ = []
+
+
+def _column_stack(columns: list[Any]) -> Any:
+    """The scalars or one-dimensional arrays in ``columns`` as the columns of a 2-D array, as ``np.column_stack``."""
+    xp = array_namespace(*columns)
+    return xp.stack([atleast_1d(column) for column in columns], axis=1)
 
 
 def phi1D_lin(xsi: float) -> list[float]:
@@ -23,10 +30,10 @@ def phi1D_quad(xsi: float) -> list[float]:
 
 
 def phi2D_lin(eta: float, xsi: float) -> np.ndarray:
-    phi = np.column_stack([(1-xsi) * (1-eta),
-                              xsi  * (1-eta),
-                              xsi  *    eta ,
-                           (1-xsi) *    eta ])
+    phi = _column_stack([(1-xsi) * (1-eta),
+                            xsi  * (1-eta),
+                            xsi  *    eta ,
+                         (1-xsi) *    eta ])
 
     return phi
 
@@ -65,6 +72,7 @@ def dxdxsi3D_lin(
     deg2m: float = 1852 * 60.0
 ) -> tuple[float, float, float, float, float, float, float, float, float]:
     dphidxsi, dphideta, dphidzet = dphidxsi3D_lin(zeta, eta, xsi)
+    xp = array_namespace(hexa_z, hexa_y, hexa_x, zeta, eta, xsi)
 
     if mesh.is_spherical():
         rad = np.pi / 180.
@@ -72,21 +80,23 @@ def dxdxsi3D_lin(
                  xsi  * (1-eta) * hexa_y[1] + \
                  xsi  *    eta  * hexa_y[2] + \
               (1-xsi) *    eta  * hexa_y[3]
-        jac_lon = deg2m * np.cos(rad * lat)
+        jac_lon = deg2m * xp.cos(rad * lat)
         jac_lat = deg2m
     else:
         jac_lon = 1
         jac_lat = 1
 
-    dxdxsi = np.dot(hexa_x, dphidxsi) * jac_lon
-    dxdeta = np.dot(hexa_x, dphideta) * jac_lon
-    dxdzet = np.dot(hexa_x, dphidzet) * jac_lon
-    dydxsi = np.dot(hexa_y, dphidxsi) * jac_lat
-    dydeta = np.dot(hexa_y, dphideta) * jac_lat
-    dydzet = np.dot(hexa_y, dphidzet) * jac_lat
-    dzdxsi = np.dot(hexa_z, dphidxsi)
-    dzdeta = np.dot(hexa_z, dphideta)
-    dzdzet = np.dot(hexa_z, dphidzet)
+    hexa_x, hexa_y, hexa_z = xp.asarray(hexa_x), xp.asarray(hexa_y), xp.asarray(hexa_z)
+    dphidxsi, dphideta, dphidzet = xp.asarray(dphidxsi), xp.asarray(dphideta), xp.asarray(dphidzet)
+    dxdxsi = xp.matmul(hexa_x, dphidxsi) * jac_lon
+    dxdeta = xp.matmul(hexa_x, dphideta) * jac_lon
+    dxdzet = xp.matmul(hexa_x, dphidzet) * jac_lon
+    dydxsi = xp.matmul(hexa_y, dphidxsi) * jac_lat
+    dydeta = xp.matmul(hexa_y, dphideta) * jac_lat
+    dydzet = xp.matmul(hexa_y, dphidzet) * jac_lat
+    dzdxsi = xp.matmul(hexa_z, dphidxsi)
+    dzdeta = xp.matmul(hexa_z, dphideta)
+    dzdzet = xp.matmul(hexa_z, dphidzet)
 
     return dxdxsi, dxdeta, dxdzet, dydxsi, dydeta, dydzet, dzdxsi, dzdeta, dzdzet
 
@@ -130,7 +140,7 @@ def jacobian3D_lin_face(
             -dxdxsi*dzdeta+dxdeta*dzdxsi,
              dxdxsi*dydeta-dxdeta*dydxsi]
 
-    jac = np.sqrt(j[0]**2+j[1]**2+j[2]**2)
+    jac = array_namespace(*j).sqrt(j[0]**2+j[1]**2+j[2]**2)
     return jac
 
 
@@ -155,11 +165,14 @@ def dxdxsi2D_lin(
     xsi: float,
 ):
     dphideta, dphidxsi = dphidxsi2D_lin(eta, xsi)
+    xp = array_namespace(quad_y, quad_x, eta, xsi)
 
-    dxdxsi = np.dot(quad_x, dphidxsi)
-    dxdeta = np.dot(quad_x, dphideta)
-    dydxsi = np.dot(quad_y, dphidxsi)
-    dydeta = np.dot(quad_y, dphideta)
+    quad_x, quad_y = xp.asarray(quad_x), xp.asarray(quad_y)
+    dphideta, dphidxsi = xp.asarray(dphideta), xp.asarray(dphidxsi)
+    dxdxsi = xp.matmul(quad_x, dphidxsi)
+    dxdeta = xp.matmul(quad_x, dphideta)
+    dydxsi = xp.matmul(quad_y, dphidxsi)
+    dydeta = xp.matmul(quad_y, dphideta)
 
     return dxdxsi, dxdeta, dydxsi, dydeta
 
@@ -172,27 +185,30 @@ def jacobian2D_lin(quad_y, quad_x, eta: float, xsi: float):
 
 
 def interpolate(phi: Callable[[float], list[float]], f: list[float], xsi: float) -> float:
-    return np.dot(phi(xsi), f)
+    xp = array_namespace(f, xsi)
+    return xp.matmul(xp.asarray(phi(xsi)), xp.asarray(f))
 
 
 def _geodetic_distance(
     lat1: float, lat2: float, lon1: float, lon2: float, mesh: BaseMesh, lat: float, deg2m: float = 1852 * 60.0
 ) -> float:
+    xp = array_namespace(lat1, lat2, lon1, lon2, lat)
     if mesh.is_spherical():
         rad = np.pi / 180.0
-        return np.sqrt(((lon2 - lon1) * deg2m * np.cos(rad * lat)) ** 2 + ((lat2 - lat1) * deg2m) ** 2)
+        return xp.sqrt(((lon2 - lon1) * deg2m * xp.cos(rad * lat)) ** 2 + ((lat2 - lat1) * deg2m) ** 2)
     else:
-        return np.sqrt((lon2 - lon1) ** 2 + (lat2 - lat1) ** 2)
+        return xp.sqrt((lon2 - lon1) ** 2 + (lat2 - lat1) ** 2)
 
 
 def _compute_jacobian_determinant(py: np.ndarray, px: np.ndarray, eta: float, xsi: float) -> float:
-    dphidxsi = np.column_stack([eta - 1, 1 - eta, eta, -eta])
-    dphideta = np.column_stack([xsi - 1, -xsi, xsi, 1 - xsi])
+    xp = array_namespace(py, px)
+    dphidxsi = _column_stack([eta - 1, 1 - eta, eta, -eta])
+    dphideta = _column_stack([xsi - 1, -xsi, xsi, 1 - xsi])
 
-    dxdxsi_diag = np.einsum("ij,ji->i", dphidxsi, px)
-    dxdeta_diag = np.einsum("ij,ji->i", dphideta, px)
-    dydxsi_diag = np.einsum("ij,ji->i", dphidxsi, py)
-    dydeta_diag = np.einsum("ij,ji->i", dphideta, py)
+    dxdxsi_diag = xp.sum(dphidxsi.T * px, axis=0)
+    dxdeta_diag = xp.sum(dphideta.T * px, axis=0)
+    dydxsi_diag = xp.sum(dphidxsi.T * py, axis=0)
+    dydeta_diag = xp.sum(dphideta.T * py, axis=0)
 
     jac_diag = dxdxsi_diag * dydeta_diag - dxdeta_diag * dydxsi_diag
     return jac_diag
