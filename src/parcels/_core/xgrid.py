@@ -11,9 +11,14 @@ from dask import is_dask_collection
 import parcels._sgrid as sgrid
 import parcels._typing as ptyping
 from parcels._core.basegrid import BaseGrid
-from parcels._core.index_search import _search_1d_array, _search_1d_columns, _search_indices_curvilinear_2d
+from parcels._core.index_search import (
+    _cached_like,
+    _search_1d_array,
+    _search_1d_columns,
+    _search_indices_curvilinear_2d,
+)
 from parcels._core.mesh import BaseMesh
-from parcels._core.utils.array_backend import array_namespace, is_gpu_array
+from parcels._core.utils.array_backend import array_namespace, asarray_like, device_of
 from parcels._core.warnings import FieldSetWarning
 from parcels._sgrid.accessor import _get_dim_to_axis_mapping, get_dim_position
 from parcels.interpolators._xinterpolators import _get_offsets_dictionary
@@ -352,21 +357,22 @@ class XGrid(BaseGrid):
                 return GridType.CurvilinearSGrid
 
     def _coordinate_values(self, coordinate_name: str, like):
-        """Values of a grid coordinate as an array of the same kind (NumPy or CuPy) as ``like``."""
-        values = self._ds[coordinate_name].values
-        if not is_gpu_array(like):
-            return values
-        gpu_coordinates = self.__dict__.setdefault("_gpu_coordinates", {})
-        if coordinate_name not in gpu_coordinates:
-            gpu_coordinates[coordinate_name] = array_namespace(like).asarray(values)
-        return gpu_coordinates[coordinate_name]
+        """Values of a grid coordinate as an array in the array library and on the device of ``like``.
+
+        The host values are converted once per library and device; NumPy gets the host array itself.
+        """
+        copies = self.__dict__.setdefault("_coordinate_copies", {}).setdefault(coordinate_name, [])
+        return _cached_like(copies, like, lambda like: asarray_like(self._ds[coordinate_name].values, like=like))
 
     def _node_coordinate_values(self, like) -> tuple[Any, Any]:
-        """Node longitudes and latitudes (``lon``, ``lat``) as arrays of the same kind (NumPy or CuPy) as ``like``."""
-        if not is_gpu_array(like):
-            return self.lon, self.lat
-        x_coordinate_name, y_coordinate_name = self.sgrid_metadata.node_coordinates
-        return self._coordinate_values(x_coordinate_name, like), self._coordinate_values(y_coordinate_name, like)
+        """Node longitudes and latitudes (``lon``, ``lat``) in the array library and on the device of ``like``.
+
+        The host values are converted once per library and device; NumPy gets the host arrays themselves.
+        """
+        copies = self.__dict__.setdefault("_node_coordinate_copies", [])
+        return _cached_like(
+            copies, like, lambda like: (asarray_like(self.lon, like=like), asarray_like(self.lat, like=like))
+        )
 
     def search(self, z, y, x, ei=None, ti=None, tau=None):
         ds = self._ds
@@ -379,12 +385,14 @@ class XGrid(BaseGrid):
             if "Y" in self.axes:
                 yi, eta = _search_1d_array(self._coordinate_values(y_coordinate_name, like=y), y)
             else:
-                yi, eta = xp.zeros(y.shape, dtype=int), xp.zeros(y.shape, dtype=float)
+                yi = xp.zeros(y.shape, dtype=xp.int64, device=device_of(y))
+                eta = xp.zeros(y.shape, dtype=xp.float64, device=device_of(y))
 
             if "X" in self.axes:
                 xi, xsi = _search_1d_array(self._coordinate_values(x_coordinate_name, like=x), x)
             else:
-                xi, xsi = xp.zeros(x.shape, dtype=int), xp.zeros(x.shape, dtype=float)
+                xi = xp.zeros(x.shape, dtype=xp.int64, device=device_of(x))
+                xsi = xp.zeros(x.shape, dtype=xp.float64, device=device_of(x))
         elif x_coordinates is not None and x_coordinates.ndim == 2:
             yi, xi = None, None
             if ei is not None:
@@ -401,7 +409,8 @@ class XGrid(BaseGrid):
         elif "Z" in self.axes:
             zi, zeta = _search_1d_array(self._coordinate_values("depth", like=z), z)
         else:
-            zi, zeta = xp.zeros(z.shape, dtype=int), xp.zeros(z.shape, dtype=float)
+            zi = xp.zeros(z.shape, dtype=xp.int64, device=device_of(z))
+            zeta = xp.zeros(z.shape, dtype=xp.float64, device=device_of(z))
 
         return {
             "Z": {"index": zi, "bcoord": zeta},
