@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 import xarray as xr
+from array_api_compat import is_cupy_array
 
 import parcels
 import parcels._sgrid as sgrid
@@ -12,7 +13,7 @@ import parcels.tutorial
 from parcels._core.index_search import GRID_SEARCH_ERROR
 from parcels._core.mesh import FlatMesh, SphericalMesh
 from parcels._core.spatialhash import _encode_morton3d
-from parcels._core.utils.array_backend import is_gpu_array, to_numpy
+from parcels._core.utils.array_backend import to_numpy
 from parcels._core.warnings import FieldEvalWarning
 from parcels._datasets.structured.generated import peninsula_dataset
 from parcels.interpolators import (
@@ -192,7 +193,7 @@ def rectilinear_cgrid_dataset(mesh: str, paddings: FacePaddings = NEMO_PADDINGS)
 def curvilinear_fieldset(mesh: str, grid_type: str, on_gpu: bool, with_land: bool = False) -> parcels.FieldSet:
     ds = curvilinear_dataset(mesh, grid_type, with_land=with_land)
     fieldset = parcels.FieldSet.from_sgrid_conventions(ds, mesh=MESHES[mesh])
-    return fieldset.to_gpu_arrays() if on_gpu else fieldset
+    return fieldset.to_windowed_arrays(cupy) if on_gpu else fieldset
 
 
 def points_inside_grid(
@@ -250,7 +251,7 @@ def eval_including_outside_points(field, *points: np.ndarray):
 def assert_search_matches(gpu_positions: dict, cpu_positions: dict) -> None:
     for axis, cpu_position in cpu_positions.items():
         gpu_index, gpu_bcoord = gpu_positions[axis]["index"], gpu_positions[axis]["bcoord"]
-        assert is_gpu_array(gpu_index) and is_gpu_array(gpu_bcoord), axis
+        assert is_cupy_array(gpu_index) and is_cupy_array(gpu_bcoord), axis
         assert gpu_index.dtype == cpu_position["index"].dtype, axis
         assert gpu_bcoord.dtype == cpu_position["bcoord"].dtype, axis
         np.testing.assert_array_equal(to_numpy(gpu_index), cpu_position["index"], err_msg=axis)
@@ -263,7 +264,7 @@ def assert_values_match(gpu_values, cpu_values, rtol: float = 1e-6, atol: float 
     The CPU blends float32 corners with float32 weights in float32, while the GPU kernels blend in
     float64, so where corners nearly cancel the two differ by more than ``rtol`` of the result.
     """
-    assert is_gpu_array(gpu_values)
+    assert is_cupy_array(gpu_values)
     if atol is None:
         atol = 8 * np.finfo(np.float32).eps * float(np.max(np.abs(cpu_values), initial=0.0))
     np.testing.assert_allclose(to_numpy(gpu_values), cpu_values, rtol=rtol, atol=atol)
@@ -294,7 +295,7 @@ def test_morton_codes_match_cpu_for_python_float_bounds():
     for bounds in [(0.0, 1.0, -2.0, 0.5, 0.0, 0.0), tuple(np.float64(bound) for bound in (0, 1, -2, 0.5, -1, 1))]:
         codes_cpu = _encode_morton3d(x, y, z, *bounds, bitwidth=1023)
         codes_gpu = _encode_morton3d(*to_gpu(x, y, z), *bounds, bitwidth=1023)
-        assert is_gpu_array(codes_gpu)
+        assert is_cupy_array(codes_gpu)
         np.testing.assert_array_equal(codes_gpu.get(), codes_cpu)
 
 
@@ -338,7 +339,7 @@ def test_curvilinear_search_matches_cpu(mesh):
     assert np.count_nonzero(positions_cpu["X"]["index"] == GRID_SEARCH_ERROR) == 3
 
     lon_gpu, _ = grid_gpu._node_coordinate_values(like=x_gpu)
-    assert is_gpu_array(lon_gpu)
+    assert is_cupy_array(lon_gpu)
     assert grid_gpu._node_coordinate_values(like=x_gpu)[0] is lon_gpu
 
     # A correct cell index for every other point, and a stale one (another point's cell) for the rest
@@ -360,7 +361,7 @@ def test_populate_indices_matches_cpu(mesh):
         pset = parcels.ParticleSet(curvilinear_fieldset(mesh, "A", on_gpu=on_gpu), x=x, y=y, z=z)
         pset.populate_indices()
         psets[on_gpu] = pset
-    assert is_gpu_array(psets[True].ei)
+    assert is_cupy_array(psets[True].ei)
     np.testing.assert_array_equal(psets[True].ei.get(), psets[False].ei)
 
 
@@ -396,7 +397,7 @@ def test_rectilinear_cgrid_eval_matches_cpu(mesh):
     for on_gpu in (False, True):
         fieldset = parcels.FieldSet.from_sgrid_conventions(peninsula_dataset(grid_type="C", mesh_str=mesh))
         fieldset.P.interp_method = CGrid_Tracer()
-        fieldsets[on_gpu] = fieldset.to_gpu_arrays() if on_gpu else fieldset
+        fieldsets[on_gpu] = fieldset.to_windowed_arrays(cupy) if on_gpu else fieldset
     rng = np.random.default_rng(3)
     domain_scale = 1.0 / 1852.0 / 60.0 if mesh == "spherical" else 1.0
     x = rng.uniform(0.0, 1.0e5, 300) * domain_scale
@@ -458,7 +459,7 @@ def test_cgrid_eval_matches_cpu_for_every_staggering(mesh, rectilinear, paddings
             ds = ds.chunk({"time": 1})
         fieldset = parcels.FieldSet.from_sgrid_conventions(ds, mesh=MESHES[mesh])
         fieldset.T.interp_method = CGrid_Tracer()
-        fieldsets[on_gpu] = fieldset.to_gpu_arrays() if on_gpu else fieldset
+        fieldsets[on_gpu] = fieldset.to_windowed_arrays(cupy) if on_gpu else fieldset
 
     t, z, y, x = sample_points(mesh, rectilinear=rectilinear)
     points_gpu = to_gpu(t, z, y, x)
@@ -497,7 +498,7 @@ def test_cgrid_rk2_advection_matches_cpu(mesh):
             verbose_progress=False,
         )
         psets[on_gpu] = pset
-    assert is_gpu_array(psets[True].x)
+    assert is_cupy_array(psets[True].x)
     assert 200 <= len(psets[False]) < 300
     assert_particles_match(psets[True], psets[False])
 
@@ -539,7 +540,7 @@ def test_nemo_3d_curvilinear_advection_matches_cpu():
     for on_gpu in (False, True):
         fieldset = parcels.FieldSet.from_sgrid_conventions(ds)
         if on_gpu:
-            fieldset.to_gpu_arrays()
+            fieldset.to_windowed_arrays(cupy)
         pset = parcels.ParticleSet(fieldset, x=x, y=y, z=z)
         pset.execute(
             AdvectionRK4_3D,
@@ -548,7 +549,7 @@ def test_nemo_3d_curvilinear_advection_matches_cpu():
             verbose_progress=False,
         )
         psets[on_gpu] = pset
-    assert is_gpu_array(psets[True].z)
+    assert is_cupy_array(psets[True].z)
     assert_particles_match(psets[True], psets[False])
 
 
@@ -570,10 +571,10 @@ def test_nemo_global_curvilinear_advection_matches_cpu():
     psets = {}
     for on_gpu in (False, True):
         if on_gpu:
-            fieldset.to_gpu_arrays()
+            fieldset.to_windowed_arrays(cupy)
         pset = parcels.ParticleSet(fieldset, x=x, y=y)
         pset.execute(AdvectionRK2, runtime=np.timedelta64(160, "D"), dt=np.timedelta64(10, "D"), verbose_progress=False)
         psets[on_gpu] = pset
-    assert is_gpu_array(psets[True].x)
+    assert is_cupy_array(psets[True].x)
     assert fieldset.U.grid.get_spatial_hash()._gpu_hash_table is not None
     assert_particles_match(psets[True], psets[False])

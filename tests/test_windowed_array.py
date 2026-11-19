@@ -1,4 +1,4 @@
-"""Tests for the transparent rolling time-window cache (WindowedArray)."""
+"""Tests for the rolling time-window cache (WindowedArray) on NumPy."""
 
 import dask.array as da
 import numpy as np
@@ -6,11 +6,17 @@ import pytest
 import xarray as xr
 
 from parcels import FieldSet, ParticleSet
-from parcels._core._windowed_array import WindowedArray, maybe_windowed
 from parcels._core.mesh import FlatMesh, SphericalMesh
 from parcels._datasets.structured.generated import simple_UV_dataset
 from parcels._datasets.unstructured.generic import _ux_constant_flow_face_centered_2D
+from parcels._windowed_array import WindowedArray, wrap_dataset
 from parcels.kernels import AdvectionRK2
+
+
+def windowed(lazy: xr.DataArray) -> tuple[xr.DataArray, WindowedArray]:
+    """``lazy`` with its storage replaced by a WindowedArray, and that WindowedArray."""
+    ds = wrap_dataset(xr.Dataset({"field": lazy}), ["field"])
+    return ds["field"], ds.variables["field"]._data
 
 
 def test_windowed_isel_matches_dask_loads_once_and_evicts():
@@ -19,7 +25,7 @@ def test_windowed_isel_matches_dask_loads_once_and_evicts():
     rng = np.random.default_rng(0)
     base = rng.standard_normal((ntime, 3, n, n))
     lazy = xr.DataArray(da.from_array(base, chunks=(1, 3, n, n)), dims=("time", "depth", "lat", "lon"))
-    win = WindowedArray(lazy)
+    windowed_lazy, win = windowed(lazy)
 
     worst, max_cache = 0.0, 0
     for step in range(40):
@@ -32,10 +38,10 @@ def test_windowed_isel_matches_dask_loads_once_and_evicts():
             lat=xr.DataArray(np.r_[yi, yi], dims="p"),
             lon=xr.DataArray(np.r_[xi, xi], dims="p"),
         )
-        got = win.isel(sel).data
+        got = windowed_lazy.isel(sel).data
         ref = lazy.isel(sel).data.compute()
         worst = max(worst, float(np.abs(got - ref).max()))
-        max_cache = max(max_cache, win._cache.sizes["time"])
+        max_cache = max(max_cache, len(win.resident_levels))
 
     assert worst == 0.0  # byte-identical to dask
     assert win.loads == ntime  # each time level read exactly once
@@ -50,7 +56,7 @@ def test_windowed_isel_backward_clock_loads_once_and_evicts():
     rng = np.random.default_rng(0)
     base = rng.standard_normal((ntime, 3, n, n))
     lazy = xr.DataArray(da.from_array(base, chunks=(1, 3, n, n)), dims=("time", "depth", "lat", "lon"))
-    win = WindowedArray(lazy)
+    windowed_lazy, win = windowed(lazy)
 
     worst, max_cache = 0.0, 0
     for step in range(40):
@@ -63,10 +69,10 @@ def test_windowed_isel_backward_clock_loads_once_and_evicts():
             lat=xr.DataArray(np.r_[yi, yi], dims="p"),
             lon=xr.DataArray(np.r_[xi, xi], dims="p"),
         )
-        got = win.isel(sel).data
+        got = windowed_lazy.isel(sel).data
         ref = lazy.isel(sel).data.compute()
         worst = max(worst, float(np.abs(got - ref).max()))
-        max_cache = max(max_cache, win._cache.sizes["time"])
+        max_cache = max(max_cache, len(win.resident_levels))
 
     assert worst == 0.0  # byte-identical to dask
     assert win.loads == ntime  # each time level read exactly once, going backward
@@ -86,16 +92,16 @@ def test_windowed_arrays_wraps_dask_but_not_numpy(fset_convention: callable, ds:
     fset_dk = fset_convention(ds.chunk({"time": 1}), mesh=mesh)
 
     # construction is never windowing -- it is opt-in via the fieldset method
-    assert not isinstance(fset_np.U.data, WindowedArray)
-    assert not isinstance(fset_dk.U.data, WindowedArray)
+    assert not isinstance(fset_np.U.data.variable._data, WindowedArray)
+    assert not isinstance(fset_dk.U.data.variable._data, WindowedArray)
     assert isinstance(fset_dk.U.data.data, da.Array)  # chunked input stays lazy (dask-backed)
 
     assert fset_np.to_windowed_arrays() is fset_np  # chainable
     fset_dk.to_windowed_arrays()
 
     # numpy-backed field is left eager; dask-backed field gets wrapped
-    assert not isinstance(fset_np.U.data, WindowedArray)
-    assert isinstance(fset_dk.U.data, WindowedArray)
+    assert not isinstance(fset_np.U.data.variable._data, WindowedArray)
+    assert isinstance(fset_dk.U.data.variable._data, WindowedArray)
     # transparency: forwarded attributes still behave like the DataArray
     assert fset_dk.U.data.dims == fset_np.U.data.dims
     assert fset_dk.U.data.shape == fset_np.U.data.shape
@@ -113,13 +119,13 @@ def test_to_windowed_arrays_is_idempotent_and_forwards_max_levels(fset_conventio
     fs = fset_convention(ds.chunk({"time": 1}), mesh=mesh)
 
     fs.to_windowed_arrays(max_levels=3)
-    first = fs.U.data
+    first = fs.U.data.variable._data
     assert isinstance(first, WindowedArray)
     assert first._max == 3
 
     # re-wrapping returns the same object (idempotent, warm cache preserved)
     fs.to_windowed_arrays(max_levels=3)
-    assert fs.U.data is first
+    assert fs.U.data.variable._data is first
 
 
 def test_windowed_isel_empty_selection():
@@ -130,29 +136,31 @@ def test_windowed_isel_empty_selection():
     ntime, n = 4, 8
     base = np.arange(ntime * 3 * n * n, dtype=float).reshape(ntime, 3, n, n)
     lazy = xr.DataArray(da.from_array(base, chunks=(1, 3, n, n)), dims=("time", "depth", "lat", "lon"))
-    win = WindowedArray(lazy)
+    windowed_lazy, win = windowed(lazy)
 
     empty = xr.DataArray(np.array([], dtype=int), dims="p")
     sel = dict(time=empty, depth=empty, lat=empty, lon=empty)
-    got = win.isel(sel)
+    got = windowed_lazy.isel(sel)
     ref = lazy.isel(sel)
 
     assert got.shape == ref.shape == (0,)
     assert got.dtype == base.dtype
     assert win.loads == 0  # nothing read
-    assert win._cache.sizes["time"] == 0  # nothing cached, nothing evicted
+    assert win.resident_levels == []  # nothing cached, nothing evicted
 
     # a warm cache must survive an interleaved empty call (no spurious eviction)
     full = xr.DataArray(np.zeros(5, dtype=int), dims="p")
-    win.isel(dict(time=full, depth=full, lat=full, lon=full))
-    assert list(win._cache["time"].values) == [0]
-    win.isel(sel)
-    assert list(win._cache["time"].values) == [0]
+    windowed_lazy.isel(dict(time=full, depth=full, lat=full, lon=full))
+    assert win.resident_levels == [0]
+    windowed_lazy.isel(sel)
+    assert win.resident_levels == [0]
 
 
-def test_maybe_windowed_passthrough_for_non_time_leading():
+def test_wrap_dataset_passthrough_for_non_time_leading():
     da_no_time = xr.DataArray(da.zeros((3, 4), chunks=(3, 4)), dims=("lat", "lon"))
-    assert maybe_windowed(da_no_time) is da_no_time  # not wrapped (no leading time dim)
+    ds = xr.Dataset({"field": da_no_time})
+    wrapped = wrap_dataset(ds, ["field"])
+    assert wrapped.variables["field"]._data is ds.variables["field"]._data  # not wrapped (no leading time dim)
 
 
 @pytest.mark.parametrize("mesh_str", ["flat", "spherical"])

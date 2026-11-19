@@ -81,7 +81,7 @@ def dask_array(draw, array=None) -> da.Array:
 
 
 @st.composite
-def chunk_cached_array(draw, array=None, max_cache_bytes=None) -> ChunkCachedArray:
+def chunk_cached_array(draw, array=None, max_cache_bytes=None, array_library=None) -> ChunkCachedArray:
     """Strategy for generating ChunkCachedArray objects.
 
     The underlying numpy array can be recovered via ``cca.array.compute()``.
@@ -94,6 +94,8 @@ def chunk_cached_array(draw, array=None, max_cache_bytes=None) -> ChunkCachedArr
     max_cache_bytes : int, optional
         Fixed cache size. If None, draws a size ranging from one byte (i.e., no chunk fits in the cache)
         to large enough to hold the whole array.
+    array_library : module, optional
+        Array library the ChunkCachedArray returns data in. Defaults to NumPy.
     """
     if array is None:
         array = dask_array()
@@ -103,7 +105,7 @@ def chunk_cached_array(draw, array=None, max_cache_bytes=None) -> ChunkCachedArr
         array = draw(dask_array(array))
     if max_cache_bytes is None:
         max_cache_bytes = draw(st.integers(min_value=1, max_value=max(array.nbytes, 1)))
-    return ChunkCachedArray(array, max_cache_bytes)
+    return ChunkCachedArray(array, max_cache_bytes, array_library)
 
 
 @st.composite

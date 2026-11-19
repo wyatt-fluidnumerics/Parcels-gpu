@@ -11,8 +11,8 @@ import xarray as xr
 from dask.base import is_dask_collection
 
 from parcels._chunk_cached_array.core import ChunkCachedArray
-from parcels._core._windowed_array import WindowedArray
-from parcels._gpu_array.core import GpuArray
+from parcels._core.utils.array_backend import NUMPY_PLACEMENT, ArrayPlacement
+from parcels._windowed_array.core import WindowedArray
 
 if TYPE_CHECKING:
     from parcels import Field, FieldSet, ParticleSet
@@ -216,16 +216,21 @@ def _print_time_interval(time_interval: TimeInterval | None) -> str:
     return repr((time_interval.left, time_interval.right))
 
 
+def _backend_name(backend: str, placement: ArrayPlacement) -> str:
+    """Name of a Parcels backend, with the array library it returns data in when that is not NumPy."""
+    if placement == NUMPY_PLACEMENT:
+        return backend
+    return f"{backend} ({placement.namespace.__name__.removeprefix('array_api_compat.')})"
+
+
 def _field_backend(field: Field | VectorField) -> str | None:
     if hasattr(field, "data"):
-        if isinstance(field.data, WindowedArray):
-            return "WindowedArray"
+        if isinstance(field.data.variable._data, WindowedArray):
+            return _backend_name("WindowedArray", field.data.variable._data.array_placement)
         elif is_dask_collection(field.data.variable._data):
             return "Dask"
         elif isinstance(field.data.variable._data, ChunkCachedArray):
-            return "ChunkCachedArray"
-        elif isinstance(field.data.variable._data, GpuArray):
-            return "GpuArray"
+            return _backend_name("ChunkCachedArray", field.data.variable._data.array_placement)
         elif isinstance(field.data.data, np.ndarray):
             return "NumPy"
         else:
