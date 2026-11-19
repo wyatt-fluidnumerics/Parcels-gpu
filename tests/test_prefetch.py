@@ -154,6 +154,19 @@ def test_thread_prefetcher_bounds_the_bytes_held_ahead():
         assert prefetcher.keys_ahead == [0]
 
 
+def test_thread_prefetcher_bounds_arrays_without_nbytes():
+    xp = pytest.importorskip("array_api_strict")
+    key_bytes = 8 * 1000
+
+    def read(key):
+        return xp.full(1000, float(key), dtype=xp.float64)  # array-api-strict arrays have no nbytes
+
+    with ThreadPrefetcher(read, max_keys_ahead=10, max_bytes_ahead=int(2.5 * key_bytes)) as prefetcher:
+        prefetcher.take(-1)
+        prefetcher.request(range(10))
+        assert sorted(prefetcher.keys_ahead) == [0, 1]
+
+
 def test_thread_prefetcher_counts_hits_misses_and_waiting():
     read = RecordingRead(held_keys=[1])
     with ThreadPrefetcher(read, max_keys_ahead=2, max_bytes_ahead=None) as prefetcher:

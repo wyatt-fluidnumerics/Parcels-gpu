@@ -12,13 +12,13 @@ import parcels._sgrid as sgrid
 import parcels._typing as ptyping
 from parcels._core.basegrid import BaseGrid
 from parcels._core.index_search import (
-    _cached_like,
+    _require_numpy_for_time_varying_depth,
     _search_1d_array,
     _search_1d_columns,
     _search_indices_curvilinear_2d,
 )
 from parcels._core.mesh import BaseMesh
-from parcels._core.utils.array_backend import array_namespace, asarray_like, device_of
+from parcels._core.utils.array_backend import array_namespace, asarray_like, cached_per_placement, device_of
 from parcels._core.warnings import FieldSetWarning
 from parcels._sgrid.accessor import _get_dim_to_axis_mapping, get_dim_position
 from parcels.interpolators._xinterpolators import _get_offsets_dictionary
@@ -362,7 +362,9 @@ class XGrid(BaseGrid):
         The host values are converted once per library and device; NumPy gets the host array itself.
         """
         copies = self.__dict__.setdefault("_coordinate_copies", {}).setdefault(coordinate_name, [])
-        return _cached_like(copies, like, lambda like: asarray_like(self._ds[coordinate_name].values, like=like))
+        return cached_per_placement(
+            copies, like, lambda like: asarray_like(self._ds[coordinate_name].values, like=like)
+        )
 
     def _node_coordinate_values(self, like) -> tuple[Any, Any]:
         """Node longitudes and latitudes (``lon``, ``lat``) in the array library and on the device of ``like``.
@@ -370,7 +372,7 @@ class XGrid(BaseGrid):
         The host values are converted once per library and device; NumPy gets the host arrays themselves.
         """
         copies = self.__dict__.setdefault("_node_coordinate_copies", [])
-        return _cached_like(
+        return cached_per_placement(
             copies, like, lambda like: (asarray_like(self.lon, like=like), asarray_like(self.lat, like=like))
         )
 
@@ -422,6 +424,7 @@ class XGrid(BaseGrid):
         """Vertical search of each particle in the z column at the centre of its cell using temporal linear
         interpolation between the snapshots ti and ti + 1.
         """
+        _require_numpy_for_time_varying_depth(z, yi, xi, ti, tau)
         found = (yi >= 0) & (xi >= 0)
         offsets = _get_offsets_dictionary(self)
         yi_centre = yi[found] + offsets["Y"]

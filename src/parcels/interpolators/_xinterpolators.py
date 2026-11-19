@@ -11,7 +11,7 @@ from dask import is_dask_collection
 import parcels._core.utils.interpolation as i_u
 import parcels._sgrid as sgrid
 import parcels._typing as ptyping
-from parcels._core.utils.array_backend import array_namespace, asarray_like, deg2rad, device_of, is_array, isclose
+from parcels._core.utils.array_backend import array_namespace, deg2rad, device_of, is_array, isclose
 from parcels.interpolators._base import ScalarInterpolator, VectorInterpolator
 
 if TYPE_CHECKING:
@@ -216,8 +216,12 @@ class XConstantField(ScalarInterpolator):
         field: Field,
     ):
         """Returning the single value of a Constant Field (with a size=(1,1,1,1) array)"""
-        x = particle_positions["x"]
-        return asarray_like(field.data[0, 0, 0, 0].values, like=x) * array_namespace(x).ones_like(x)
+        xp = array_namespace(particle_positions["x"])
+        x = xp.asarray(particle_positions["x"])
+        value = field.data[0, 0, 0, 0].values
+        # Filled where x is, which spares a host-to-device copy of the value on every call
+        value_like_x = xp.full((), value.item(), dtype=getattr(xp, value.dtype.name), device=device_of(x))
+        return value_like_x * xp.ones_like(x)
 
 
 class XLinear_Velocity(VectorInterpolator):  # noqa:  N801
@@ -496,15 +500,14 @@ def _Spatialslip(
     if vectorfield.W:
         axis_dimW = vectorfield.W.grid.get_axis_dim_mapping(vectorfield.W.data.dims)
         corner_dataW = _get_corner_data_Agrid(vectorfield.W.data, ti, zi, yi, xi, lenT, lenZ, npart, axis_dimW)
-    zero = asarray_like(0.0, like=corner_dataU)
 
     def is_land(ti: int, zi: int, yi: int, xi: int):
         uval = corner_dataU[ti, zi, yi, xi, :]
         vval = corner_dataV[ti, zi, yi, xi, :]
         wval = None if corner_dataW is None else corner_dataW[ti, zi, yi, xi, :]
-        land_check = isclose(uval, zero) & isclose(vval, zero)
+        land_check = isclose(uval, 0.0) & isclose(vval, 0.0)
         if wval is not None:
-            land_check = land_check & isclose(wval, zero)
+            land_check = land_check & isclose(wval, 0.0)
         return land_check
 
     if is_dask_collection(u):
@@ -686,7 +689,7 @@ class XLinearInvdistLandTracer(ScalarInterpolator):
 
         corner_data = _get_corner_data_Agrid(field.data, ti, zi, yi, xi, lenT, lenZ, xsi.shape[0], axis_dim)
 
-        land_mask = isclose(corner_data, asarray_like(0.0, like=corner_data))
+        land_mask = isclose(corner_data, 0.0)
         nb_land = xp.sum(xp.astype(land_mask, xp.int64), axis=(0, 1, 2, 3))
 
         if xp.any(nb_land):

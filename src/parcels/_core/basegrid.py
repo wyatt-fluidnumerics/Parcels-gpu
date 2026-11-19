@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from parcels._core.index_search import _length
 from parcels._core.mesh import FlatMesh, SphericalMesh
 from parcels._core.spatialhash import SpatialHash
 from parcels._core.utils.array_backend import array_namespace, device_of
@@ -253,7 +252,7 @@ def _unravel(dims, ei):
 
     xp = array_namespace(ei)
     ei = xp.asarray(ei)
-    indices = xp.empty((len(dims), _length(ei)), dtype=xp.int64, device=device_of(ei))
+    indices = xp.empty((len(dims), ei.shape[0]), dtype=xp.int64, device=device_of(ei))
 
     for i in range(len(dims) - 1):
         indices[i, :] = ei // int(strides[i + 1])

@@ -72,7 +72,6 @@ def dxdxsi3D_lin(
     deg2m: float = 1852 * 60.0
 ) -> tuple[float, float, float, float, float, float, float, float, float]:
     dphidxsi, dphideta, dphidzet = dphidxsi3D_lin(zeta, eta, xsi)
-    xp = array_namespace(hexa_z, hexa_y, hexa_x, zeta, eta, xsi)
 
     if mesh.is_spherical():
         rad = np.pi / 180.
@@ -80,23 +79,21 @@ def dxdxsi3D_lin(
                  xsi  * (1-eta) * hexa_y[1] + \
                  xsi  *    eta  * hexa_y[2] + \
               (1-xsi) *    eta  * hexa_y[3]
-        jac_lon = deg2m * xp.cos(rad * lat)
+        jac_lon = deg2m * np.cos(rad * lat)
         jac_lat = deg2m
     else:
         jac_lon = 1
         jac_lat = 1
 
-    hexa_x, hexa_y, hexa_z = xp.asarray(hexa_x), xp.asarray(hexa_y), xp.asarray(hexa_z)
-    dphidxsi, dphideta, dphidzet = xp.asarray(dphidxsi), xp.asarray(dphideta), xp.asarray(dphidzet)
-    dxdxsi = xp.matmul(hexa_x, dphidxsi) * jac_lon
-    dxdeta = xp.matmul(hexa_x, dphideta) * jac_lon
-    dxdzet = xp.matmul(hexa_x, dphidzet) * jac_lon
-    dydxsi = xp.matmul(hexa_y, dphidxsi) * jac_lat
-    dydeta = xp.matmul(hexa_y, dphideta) * jac_lat
-    dydzet = xp.matmul(hexa_y, dphidzet) * jac_lat
-    dzdxsi = xp.matmul(hexa_z, dphidxsi)
-    dzdeta = xp.matmul(hexa_z, dphideta)
-    dzdzet = xp.matmul(hexa_z, dphidzet)
+    dxdxsi = np.dot(hexa_x, dphidxsi) * jac_lon
+    dxdeta = np.dot(hexa_x, dphideta) * jac_lon
+    dxdzet = np.dot(hexa_x, dphidzet) * jac_lon
+    dydxsi = np.dot(hexa_y, dphidxsi) * jac_lat
+    dydeta = np.dot(hexa_y, dphideta) * jac_lat
+    dydzet = np.dot(hexa_y, dphidzet) * jac_lat
+    dzdxsi = np.dot(hexa_z, dphidxsi)
+    dzdeta = np.dot(hexa_z, dphideta)
+    dzdzet = np.dot(hexa_z, dphidzet)
 
     return dxdxsi, dxdeta, dxdzet, dydxsi, dydeta, dydzet, dzdxsi, dzdeta, dzdzet
 
@@ -140,7 +137,7 @@ def jacobian3D_lin_face(
             -dxdxsi*dzdeta+dxdeta*dzdxsi,
              dxdxsi*dydeta-dxdeta*dydxsi]
 
-    jac = array_namespace(*j).sqrt(j[0]**2+j[1]**2+j[2]**2)
+    jac = np.sqrt(j[0]**2+j[1]**2+j[2]**2)
     return jac
 
 
@@ -165,14 +162,11 @@ def dxdxsi2D_lin(
     xsi: float,
 ):
     dphideta, dphidxsi = dphidxsi2D_lin(eta, xsi)
-    xp = array_namespace(quad_y, quad_x, eta, xsi)
 
-    quad_x, quad_y = xp.asarray(quad_x), xp.asarray(quad_y)
-    dphideta, dphidxsi = xp.asarray(dphideta), xp.asarray(dphidxsi)
-    dxdxsi = xp.matmul(quad_x, dphidxsi)
-    dxdeta = xp.matmul(quad_x, dphideta)
-    dydxsi = xp.matmul(quad_y, dphidxsi)
-    dydeta = xp.matmul(quad_y, dphideta)
+    dxdxsi = np.dot(quad_x, dphidxsi)
+    dxdeta = np.dot(quad_x, dphideta)
+    dydxsi = np.dot(quad_y, dphidxsi)
+    dydeta = np.dot(quad_y, dphideta)
 
     return dxdxsi, dxdeta, dydxsi, dydeta
 
@@ -185,8 +179,7 @@ def jacobian2D_lin(quad_y, quad_x, eta: float, xsi: float):
 
 
 def interpolate(phi: Callable[[float], list[float]], f: list[float], xsi: float) -> float:
-    xp = array_namespace(f, xsi)
-    return xp.matmul(xp.asarray(phi(xsi)), xp.asarray(f))
+    return np.dot(phi(xsi), f)
 
 
 def _geodetic_distance(

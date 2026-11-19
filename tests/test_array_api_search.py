@@ -11,11 +11,13 @@ from parcels._core.index_search import (
     LEFT_OUT_OF_BOUNDS,
     RIGHT_OUT_OF_BOUNDS,
     _search_1d_array,
+    _search_1d_columns,
     _search_time_index,
 )
 from parcels._core.spatialhash import _encode_morton3d
 from parcels._core.utils.array_backend import array_namespace, namespace_of_library, to_numpy
-from parcels._datasets.structured.generated import simple_UV_dataset
+from parcels._core.warnings import FieldSetWarning
+from parcels._datasets.structured.generated import simple_UV_dataset, simple_UV_sigma_dataset
 from parcels._datasets.structured.generic import datasets
 
 
@@ -185,6 +187,24 @@ def test_search_time_index(xp):
     assert_positions_match_numpy(result, expected, xp)
 
 
+def test_search_time_index_converts_each_time_axis_once(xp):
+    """Fields of different models keep time axes of their own, each converted once per array library."""
+    fields = [
+        FieldSet.from_sgrid_conventions(simple_UV_dataset(n_times=n_times, nz=2, ny=6, nx=5)).U for n_times in (4, 7)
+    ]
+    times = [np.linspace(0.0, float(field.time_interval.time_length_as_flt), 25) for field in fields]
+    expected = [_search_time_index(field, time) for field, time in zip(fields, times, strict=True)]
+
+    for _ in range(2):
+        for field, time, expected_positions in zip(fields, times, expected, strict=True):
+            assert_positions_match_numpy(_search_time_index(field, xp.asarray(time)), expected_positions, xp)
+
+    for field in fields:
+        copies = [values for copy_xp, _, values in field.model._time_axis_copies if copy_xp is xp]
+        assert len(copies) == 1
+        assert array_namespace(copies[0]) is xp
+
+
 def test_search_time_index_without_time_interval(xp):
     field = FieldSet.from_sgrid_conventions(simple_UV_dataset(n_times=1, nz=2, ny=6, nx=5)).U
     assert field.time_interval is None
@@ -194,6 +214,40 @@ def test_search_time_index_without_time_interval(xp):
     result = _search_time_index(field, xp.asarray(time))
 
     assert_positions_match_numpy(result, expected, xp)
+
+
+@pytest.fixture(scope="module")
+def sigma_field():
+    """A field on a flat-bottomed sigma grid, whose layer depths change in time with the surface elevation."""
+    n_times, nz, ny, nx = 3, 4, 6, 7
+    rng = np.random.default_rng(5)
+    bottom_depth_m = 10.0 + rng.uniform(0.0, 2.0, (ny, nx))
+    surface_elevation_m = rng.uniform(-0.3, 0.3, (n_times, ny, nx))
+    ds = simple_UV_sigma_dataset(n_times, nz, ny, nx, bottom_depth=bottom_depth_m, eta=surface_elevation_m)
+    with pytest.warns(FieldSetWarning, match="Time-varying"):
+        return FieldSet.from_sgrid_conventions(ds).U
+
+
+def test_time_varying_depth_search_needs_numpy(xp, sigma_field):
+    grid = sigma_field.grid
+    rng = np.random.default_rng(6)
+    n_points = 20
+    x = rng.uniform(grid.lon[1], grid.lon[-2], n_points)
+    y = rng.uniform(grid.lat[1], grid.lat[-2], n_points)
+    z = rng.uniform(2.0, 8.0, n_points)
+    time_positions = _search_time_index(sigma_field, np.full(n_points, 1800.0))["T"]
+    ti, tau = time_positions["index"], time_positions["bcoord"]
+    expected = grid.search(z, y, x, ti=ti, tau=tau)
+    assert np.all(expected["Z"]["index"] >= 0)
+
+    positions = [xp.asarray(values) for values in (z, y, x)]
+    if xp is namespace_of_library(np):
+        assert_positions_match_numpy(grid.search(*positions, ti=ti, tau=tau), expected, xp)
+        return
+    with pytest.raises(NotImplementedError, match="only supported with NumPy arrays"):
+        grid.search(*positions, ti=xp.asarray(ti), tau=xp.asarray(tau))
+    with pytest.raises(NotImplementedError, match="only supported with NumPy arrays"):
+        _search_1d_columns(np.broadcast_to(np.linspace(0.0, 10.0, 4), (n_points, 4)), positions[0])
 
 
 def test_ravel_unravel_index_round_trip(xp, rectilinear_grid):

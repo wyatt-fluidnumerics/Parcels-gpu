@@ -37,8 +37,9 @@ def AdvectionDiffusionM1(particles, fieldset):  # pragma: no cover
     """
     xp = array_namespace(particles.x)
     # Wiener increment with zero mean and std of sqrt(dt), drawn from NumPy's global random state
-    dWx = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
-    dWy = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
+    wiener_increment_std = np.sqrt(np.fabs(to_numpy(particles.dt)))
+    dWx = asarray_like(np.random.normal(0, wiener_increment_std), like=particles.dt)
+    dWy = asarray_like(np.random.normal(0, wiener_increment_std), like=particles.dt)
 
     Kxp1 = fieldset.Kh_zonal[particles.t, particles.z, particles.y, particles.x + fieldset.dres, particles]
     Kxm1 = fieldset.Kh_zonal[particles.t, particles.z, particles.y, particles.x - fieldset.dres, particles]
@@ -85,8 +86,9 @@ def AdvectionDiffusionEM(particles, fieldset):  # pragma: no cover
     """
     xp = array_namespace(particles.x)
     # Wiener increment with zero mean and std of sqrt(dt), drawn from NumPy's global random state
-    dWx = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
-    dWy = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
+    wiener_increment_std = np.sqrt(np.fabs(to_numpy(particles.dt)))
+    dWx = asarray_like(np.random.normal(0, wiener_increment_std), like=particles.dt)
+    dWy = asarray_like(np.random.normal(0, wiener_increment_std), like=particles.dt)
 
     u, v = fieldset.UV[particles.t, particles.z, particles.y, particles.x, particles]
 
@@ -141,8 +143,9 @@ def DiffusionUniformKh(particles, fieldset):  # pragma: no cover
     """
     xp = array_namespace(particles.x)
     # Wiener increment with zero mean and std of sqrt(dt), drawn from NumPy's global random state
-    dWx = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
-    dWy = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
+    wiener_increment_std = np.sqrt(np.fabs(to_numpy(particles.dt)))
+    dWx = asarray_like(np.random.normal(0, wiener_increment_std), like=particles.dt)
+    dWy = asarray_like(np.random.normal(0, wiener_increment_std), like=particles.dt)
 
     kh_zonal = fieldset.Kh_zonal[particles]
     kh_meridional = fieldset.Kh_meridional[particles]

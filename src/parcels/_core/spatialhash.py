@@ -6,7 +6,6 @@ import numpy as np
 
 from parcels._core.index_search import (
     GRID_SEARCH_ERROR,
-    _cached_like,
     _latlon_rad_to_xyz,
     curvilinear_point_in_cell,
     uxgrid_point_in_cell,
@@ -14,9 +13,11 @@ from parcels._core.index_search import (
 from parcels._core.utils.array_backend import (
     array_namespace,
     asarray_like,
+    cached_per_placement,
     deg2rad,
     device_of,
     flatnonzero,
+    indices_to_mask,
     is_array,
     unravel_index,
 )
@@ -395,7 +396,7 @@ class SpatialHash:
         The table is built on the host and converted on the first query from each library and device;
         NumPy gets the host arrays themselves.
         """
-        return _cached_like(
+        return cached_per_placement(
             self._hash_table_copies,
             like,
             lambda like: {name: asarray_like(values, like=like) for name, values in self._hash_table.items()},
@@ -554,8 +555,10 @@ class SpatialHash:
             uniq_q = uniq_q[keep]
             pos_first = f_indices[q_idx[keep]]
 
-            # Scatter through a mask over the queries: the code wants the first True inside each slice
-            is_located = xp.isin(xp.arange(num_queries, dtype=uniq_q.dtype, device=device), uniq_q)
+            # The code wants the first True inside each slice. It is scattered through a mask over the queries,
+            # which assigns to them in ascending order; that lines up with the rows of j_all[pos_first] only
+            # because uniq_q is strictly increasing.
+            is_located = indices_to_mask(uniq_q, num_queries)
             j_best[is_located] = xp.astype(j_all[pos_first], j_best.dtype)
             i_best[is_located] = xp.astype(i_all[pos_first], i_best.dtype)
             coords_best[is_located] = xp.astype(xp.take(coordinates, pos_first, axis=0), coords_best.dtype)
@@ -881,8 +884,8 @@ def _encode_quantized_morton3d(xq, yq, zq):
 
     # --- 3) Bit-dilate each 10-bit number so each bit is separated by two zeros. ---
     # _dilate_bits maps:  b9..b0  ->  b9 0 0 b8 0 0 ... b0 0 0
-    # Cast to uint32 first: _dilate_bits keeps int64 input in int64, and the cell coordinates of a table
-    # with more than 2**31 entries are int64
+    # Cast to uint32 first: _dilate_bits keeps int64 input as int64, and the per-entry arrays the host
+    # hash table is built from are kept in uint32 to bound its memory
     dx3 = _dilate_bits(xq.astype(np.uint32, copy=False)).astype(np.uint32)
     dy3 = _dilate_bits(yq.astype(np.uint32, copy=False)).astype(np.uint32)
     dz3 = _dilate_bits(zq.astype(np.uint32, copy=False)).astype(np.uint32)

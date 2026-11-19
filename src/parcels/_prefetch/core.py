@@ -12,13 +12,14 @@ set.
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Hashable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Protocol, Self, runtime_checkable
+
+from parcels._core.utils.array_backend import nbytes_of
 
 __all__ = ["NoPrefetcher", "Prefetcher", "PrefetcherFactory", "ReadFunction", "ThreadPrefetcher"]
 
@@ -53,18 +54,6 @@ class Prefetcher(Protocol):
 
 
 PrefetcherFactory = Callable[[ReadFunction], Prefetcher]
-
-
-def _nbytes(value: Any) -> int:
-    """Size in bytes of an array, also for array types without an ``nbytes`` attribute."""
-    nbytes = getattr(value, "nbytes", None)
-    if nbytes is not None:
-        return int(nbytes)
-    shape = getattr(value, "shape", None)
-    itemsize = getattr(getattr(value, "dtype", None), "itemsize", None)
-    if shape is None or itemsize is None:
-        return 0
-    return math.prod(shape) * int(itemsize)
 
 
 class NoPrefetcher:
@@ -206,14 +195,14 @@ class ThreadPrefetcher:
         held = 0
         for read in self._reads.values():
             if read.done() and not read.cancelled() and read.exception() is None:
-                held += _nbytes(read.result())
+                held += nbytes_of(read.result())
             else:
                 held += self._largest_result_bytes
         return held
 
     def _read_and_measure(self, key: Hashable) -> Any:
         value = self._read(key)
-        nbytes = _nbytes(value)
+        nbytes = nbytes_of(value)
         with self._lock:
             self._largest_result_bytes = max(self._largest_result_bytes, nbytes)
         return value

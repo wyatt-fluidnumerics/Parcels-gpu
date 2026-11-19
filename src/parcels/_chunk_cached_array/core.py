@@ -11,7 +11,8 @@ from parcels._core.utils.array_backend import (
     NUMPY_PLACEMENT,
     ArrayPlacement,
     flatnonzero,
-    namespace_of_library,
+    host_array_for_conversion,
+    placement_of_library,
     ravel_multi_index,
     to_numpy,
     unravel_index,
@@ -22,24 +23,6 @@ from .lru_cache import ByteBoundedLRUCache
 if TYPE_CHECKING:
     import dask.array
     import xarray as xr
-
-
-def _placement_of_library(array_library: ModuleType | None, device: Any) -> ArrayPlacement:
-    """Where arrays created in ``array_library`` on ``device`` live, with the device named as the library names it.
-
-    ``None`` means NumPy. Naming the device the library's way lets placements reported by different
-    backends, and by arrays themselves, compare equal.
-    """
-    probe = ArrayPlacement(namespace_of_library(array_library), device).asarray(np.empty(0, dtype=np.float64))
-    return ArrayPlacement.of(probe)
-
-
-def _host_array(values: Any) -> np.ndarray:
-    """``values`` as a C-contiguous, writable NumPy array in native byte order, ready to hand to any array library."""
-    values = np.asarray(values)
-    if not values.dtype.isnative:
-        values = values.astype(values.dtype.newbyteorder("="))
-    return np.require(values, requirements=["C", "W"])
 
 
 def wrap_dataset(
@@ -81,7 +64,7 @@ def wrap_dataset(
     """
     from dask.base import is_dask_collection
 
-    converts_other_data = _placement_of_library(array_library, device) != NUMPY_PLACEMENT
+    converts_other_data = placement_of_library(array_library, device) != NUMPY_PLACEMENT
     ds = ds.copy()
     # Load coordinates eagerly — they are small 1D arrays and keeping them
     # as dask arrays causes expensive task-graph construction on every .isel().
@@ -135,7 +118,7 @@ class ChunkCachedArray(ExplicitlyIndexedNDArrayMixin):
     ) -> None:
         self.array = dask_array
         self.cache = ByteBoundedLRUCache(max_cache_bytes)
-        self._array_placement = _placement_of_library(array_library, device)
+        self._array_placement = placement_of_library(array_library, device)
 
         # Precompute chunk boundaries per dimension.
         # _boundaries[d] is a 1D array of cumulative chunk sizes, e.g., [0, 15, 30].
@@ -146,7 +129,9 @@ class ChunkCachedArray(ExplicitlyIndexedNDArrayMixin):
         if self._array_placement == NUMPY_PLACEMENT:
             self._dtype_in_library = dask_array.dtype
         else:
-            self._dtype_in_library = self._array_placement.asarray(_host_array(np.empty(0, dask_array.dtype))).dtype
+            self._dtype_in_library = self._array_placement.asarray(
+                host_array_for_conversion(np.empty(0, dask_array.dtype))
+            ).dtype
 
     @property
     def array_placement(self) -> ArrayPlacement:
@@ -164,7 +149,7 @@ class ChunkCachedArray(ExplicitlyIndexedNDArrayMixin):
         if chunk_data is None:
             chunk_data = self.array.blocks[key].compute()
             if self._array_placement != NUMPY_PLACEMENT:
-                chunk_data = self._array_placement.asarray(_host_array(chunk_data))
+                chunk_data = self._array_placement.asarray(host_array_for_conversion(chunk_data))
             self.cache.put(key, chunk_data)
         return chunk_data
 

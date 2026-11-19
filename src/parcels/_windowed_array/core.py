@@ -18,8 +18,14 @@ from xarray.core.indexing import (
 )
 
 from parcels._chunk_cached_array import ChunkCachedArray
-from parcels._chunk_cached_array.core import _host_array, _placement_of_library
-from parcels._core.utils.array_backend import NUMPY_PLACEMENT, ArrayPlacement, is_array, to_numpy
+from parcels._core.utils.array_backend import (
+    NUMPY_PLACEMENT,
+    ArrayPlacement,
+    host_array_for_conversion,
+    is_array,
+    placement_of_library,
+    to_numpy,
+)
 from parcels._core.warnings import FieldSetWarning
 from parcels._prefetch import Prefetcher, PrefetcherFactory, ThreadPrefetcher
 
@@ -73,7 +79,7 @@ def wrap_dataset(
     xr.Dataset
         Copy with the field variables wrapped in WindowedArray.
     """
-    placement = _placement_of_library(array_library, device)
+    placement = placement_of_library(array_library, device)
     ds = ds.copy()
     for name in list(ds.coords):
         ds[name].load()
@@ -122,7 +128,7 @@ class _TimeLevelReader:
         values = self.array[level]
         if is_dask_collection(values):
             values = values.compute()
-        return _host_array(values)
+        return host_array_for_conversion(values)
 
 
 class WindowedArray(ExplicitlyIndexedNDArrayMixin):
@@ -192,7 +198,7 @@ class WindowedArray(ExplicitlyIndexedNDArrayMixin):
         self._array_library = array_library
         self._device = device
         self._prefetcher_factory = prefetcher
-        self._placement = _placement_of_library(array_library, device)
+        self._placement = placement_of_library(array_library, device)
         xp = self._placement.namespace
         self._read_level = _TimeLevelReader(array)
 
@@ -214,7 +220,7 @@ class WindowedArray(ExplicitlyIndexedNDArrayMixin):
             self._prefetcher = (ThreadPrefetcher if prefetcher is None else prefetcher)(self._read_level)
         else:
             host_values = array.compute() if is_dask_collection(array) else array
-            self._buffer = self._placement.asarray(_host_array(host_values))
+            self._buffer = self._placement.asarray(host_array_for_conversion(host_values))
             self._level_held_by_slot = np.arange(n_levels, dtype=np.int64)
             self.loads = n_levels
             self.bytes_read = n_levels * self._level_bytes
@@ -265,7 +271,7 @@ class WindowedArray(ExplicitlyIndexedNDArrayMixin):
         if not self._is_windowed:
             return self._buffer
         host_values = self.array.compute() if is_dask_collection(self.array) else self.array
-        return self._placement.asarray(_host_array(host_values))
+        return self._placement.asarray(host_array_for_conversion(host_values))
 
     # --- window management ---
 

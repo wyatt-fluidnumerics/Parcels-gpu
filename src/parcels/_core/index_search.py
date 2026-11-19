@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from array_api_compat import is_numpy_array
 
 from parcels._core.statuscodes import _raise_outside_time_interval_error
 from parcels._core.utils.array_backend import (
     array_namespace,
     asarray_like,
     atleast_1d,
+    cached_per_placement,
     copy_of,
     deg2rad,
     device_of,
     is_array,
 )
-from parcels._core.utils.time import timedelta_to_float
 
 if TYPE_CHECKING:
     from parcels._core.field import Field
@@ -28,32 +28,18 @@ LEFT_OUT_OF_BOUNDS = -2
 RIGHT_OUT_OF_BOUNDS = -1
 
 
-def _cached_like(copies: list[tuple[ModuleType, Any, Any]], like: Any, convert: Callable[[Any], Any]) -> Any:
-    """The entry of ``copies`` for the array library and device of ``like``, made with ``convert(like)`` on first use.
+def _require_numpy_for_time_varying_depth(*arrays: Any) -> None:
+    """Raise ``NotImplementedError`` when one of ``arrays`` belongs to an array library other than NumPy.
 
-    Host-side constants that meet particle arrays are converted once per library and device. Entries are found by
-    comparing devices because the device objects of some libraries (CuPy) are not hashable.
+    The vertical search in a time-varying depth gathers the depth columns through xarray and searches them with
+    NumPy, which other libraries' arrays would either fail in or be silently converted by.
     """
-    xp = array_namespace(like)
-    device = _device_of(like)
-    for copy_xp, copy_device, values in copies:
-        if copy_xp is xp and copy_device == device:
-            return values
-    values = convert(like)
-    copies.append((xp, device, values))
-    return values
-
-
-def _device_of(values: Any) -> Any:
-    """Device of the array ``values``; ``None`` for Python scalars and sequences, which NumPy takes as they are."""
-    return device_of(values) if is_array(values) else None
-
-
-def _length(values: Any) -> int:
-    """``len(values)``, also for arrays of libraries without ``__len__`` (array-api-strict)."""
-    if is_array(values) and values.ndim > 0:
-        return values.shape[0]
-    return len(values)
+    for array in arrays:
+        if is_array(array) and not is_numpy_array(array):
+            library = type(array).__module__.split(".")[0]
+            raise NotImplementedError(
+                f"Time-varying (4D) vertical grids are only supported with NumPy arrays, not with {library} arrays."
+            )
 
 
 def _search_1d_array(
@@ -82,13 +68,15 @@ def _search_1d_array(
     """
     xp = array_namespace(x)
     # TODO v4: We probably rework this to deal with 0D arrays before this point (as we already know field dimensionality)
-    if _length(arr) < 2:
+    if arr.shape[0] < 2:
         return xp.zeros(x.shape, dtype=xp.int32, device=device_of(x)), xp.zeros_like(x)
     arr = asarray_like(arr, like=x)
     if is_array(x) and xp.isdtype(x.dtype, "real floating") and xp.isdtype(arr.dtype, "integral"):
-        # Integer coordinates are cast explicitly to the floating-point type NumPy promotes them to with x
-        exact_float = xp.float32 if xp.iinfo(arr.dtype).bits <= 16 else xp.float64
-        arr = xp.astype(arr, xp.result_type(x.dtype, exact_float))
+        # The standard does not promote integers with floats, so integer coordinates are cast to the type NumPy
+        # promotes them to: with float32 positions, float32 for integers of up to 16 bits and float64 for wider
+        # ones; with float64 positions, float64
+        lowest_float_for_integers = xp.float32 if xp.iinfo(arr.dtype).bits <= 16 else xp.float64
+        arr = xp.astype(arr, xp.result_type(x.dtype, lowest_float_for_integers))
     index = xp.clip(xp.searchsorted(arr, x, side="left") - 1, 0, arr.shape[0] - 2)
     # Use broadcasting to avoid repeated array access
     arr_index = arr[index]
@@ -130,6 +118,7 @@ def _search_1d_columns(columns: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, 
     array of float
         Barycentric coordinate.
     """
+    _require_numpy_for_time_varying_depth(columns, x)
     n_levels = columns.shape[1]
     if n_levels < 2:
         return np.zeros(shape=x.shape, dtype=np.int32), np.zeros_like(x)
@@ -171,7 +160,7 @@ def _search_time_index(field: Field, time: np.ndarray):
     if not field.time_interval.is_all_time_in_interval(time):
         _raise_outside_time_interval_error(time, field=None)
 
-    time_flt = timedelta_to_float(field.data.time.data - field.time_interval.left)
+    time_flt = field.model._time_axis_seconds_like(time)
     ti, tau = _search_1d_array(time_flt, time)
 
     return {"T": {"index": atleast_1d(ti), "bcoord": atleast_1d(tau)}}
@@ -218,13 +207,13 @@ _invA_copies: list[tuple[ModuleType, Any, Any]] = []
 
 def _invA_in(like: Any) -> Any:
     """``_invA`` as a float64 array in the array library and on the device of ``like``, converted only once."""
-    return _cached_like(_invA_copies, like, lambda like: asarray_like(_invA, like=like, dtype="float64"))
+    return cached_per_placement(_invA_copies, like, lambda like: asarray_like(_invA, like=like, dtype="float64"))
 
 
 def _bilinear_inverse(px, py, xq, yq):
     """Solve for (xsi, eta) s.t. bilinear blend of (px, py) corners equals (xq, yq)."""
     xp = array_namespace(px, xq)
-    eta_init = -1.0 * xp.ones(_length(xq), dtype=xp.float64, device=device_of(xq))
+    eta_init = -1.0 * xp.ones(xq.shape[0], dtype=xp.float64, device=device_of(xq))
     invA = _invA_in(px)
     a, b = xp.matmul(invA, px), xp.matmul(invA, py)
     aa = a[3, ...] * b[2, ...] - a[2, ...] * b[3, ...]
@@ -398,12 +387,15 @@ def _search_indices_curvilinear_2d(
         x_check = x[not_found]
     else:
         # Otherwise, we need to check all points
-        yi = xp.full(_length(y), GRID_SEARCH_ERROR, dtype=xp.int32, device=_device_of(y))
-        xi = xp.full(_length(x), GRID_SEARCH_ERROR, dtype=xp.int32, device=_device_of(x))
+        # Positions may be passed as Python sequences, which have no shape or device
+        y = xp.asarray(y)
+        x = xp.asarray(x)
+        yi = xp.full(y.shape[0], GRID_SEARCH_ERROR, dtype=xp.int32, device=device_of(y))
+        xi = xp.full(x.shape[0], GRID_SEARCH_ERROR, dtype=xp.int32, device=device_of(x))
         y_check = y
         x_check = x
-        coords = -1.0 * xp.ones((_length(y), 2), dtype=xp.float32, device=_device_of(y))
-        not_found = xp.ones(_length(y), dtype=xp.bool, device=_device_of(y))
+        coords = -1.0 * xp.ones((y.shape[0], 2), dtype=xp.float32, device=device_of(y))
+        not_found = xp.ones(y.shape[0], dtype=xp.bool, device=device_of(y))
 
     # If there are any points that were not found in the first step, we query the spatial hash for those points
     if xp.any(not_found):

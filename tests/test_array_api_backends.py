@@ -1,7 +1,8 @@
 """The Parcels backends (ChunkCachedArray, WindowedArray) holding field data in NumPy, array-api-strict and PyTorch.
 
 Every gather is compared against NumPy fancy indexing of the full array, and must return an array of the
-backend's library.
+backend's library. The shared helpers the backends and the core use to place, convert and measure arrays
+(``parcels._core.utils.array_backend``) are tested at the end.
 """
 
 import functools
@@ -18,7 +19,21 @@ import parcels
 import parcels._strategies.chunk_cached_array as ccast
 from parcels._chunk_cached_array import ByteBoundedLRUCache, ChunkCachedArray
 from parcels._core.mesh import FlatMesh
-from parcels._core.utils.array_backend import NUMPY_PLACEMENT, array_namespace, namespace_of_library, to_numpy
+from parcels._core.utils.array_backend import (
+    NUMPY_PLACEMENT,
+    ArrayPlacement,
+    array_namespace,
+    asarray_like,
+    cached_per_placement,
+    device_of,
+    host_array_for_conversion,
+    indices_to_mask,
+    namespace_of_library,
+    nbytes_of,
+    placement_of_library,
+    to_numpy,
+    values_like,
+)
 from parcels._core.warnings import FieldSetWarning
 from parcels._datasets.structured.generated import simple_UV_dataset
 from parcels._datasets.unstructured.generic import _ux_constant_flow_face_centered_2D
@@ -339,3 +354,128 @@ def test_other_libraries_need_a_structured_grid(method):
     fieldset = parcels.FieldSet.from_ugrid_conventions(_ux_constant_flow_face_centered_2D().chunk({"time": 1}))
     with pytest.raises(NotImplementedError, match="structured"):
         getattr(fieldset, method)(torch)
+
+
+# ------------------------------------------------------------------------------------------------
+# Shared helpers (parcels._core.utils.array_backend)
+# ------------------------------------------------------------------------------------------------
+def test_placement_of_library(library):
+    placement = placement_of_library(library)
+    assert placement.namespace is namespace_of_library(library)
+    assert placement == ArrayPlacement.of(as_library(library, [1.0]))
+    assert placement_of_library(None) == NUMPY_PLACEMENT
+
+
+def test_host_array_for_conversion():
+    values = np.arange(12.0).reshape(3, 4)
+    assert host_array_for_conversion(values) is values  # already C-contiguous, writable and in native byte order
+
+    read_only = values.copy()
+    read_only.flags.writeable = False
+    for source in (read_only, values[:, ::2], values.astype(">f8"), [[1.0, 2.0]]):
+        prepared = host_array_for_conversion(source)
+        assert prepared.flags["C_CONTIGUOUS"] and prepared.flags["WRITEABLE"] and prepared.dtype.isnative
+        np.testing.assert_array_equal(prepared, np.asarray(source))
+    assert not np.shares_memory(host_array_for_conversion(read_only), read_only)
+
+
+def test_asarray_like_takes_any_host_array(library):
+    like = as_library(library, [0.0])
+    values = np.arange(12.0).reshape(3, 4)
+    read_only = values.copy()
+    read_only.flags.writeable = False
+    for source in (values, read_only, values[:, ::2], values.astype(">f8"), values.astype(np.float32)):
+        converted = asarray_like(source, like=like)
+        assert_gathered(converted, library, source)
+        assert to_numpy(converted).dtype.newbyteorder("=") == source.dtype.newbyteorder("=")
+    if library is np:
+        assert asarray_like(read_only, like=like) is read_only  # NumPy computes on the host array itself
+    else:
+        assert not np.shares_memory(to_numpy(asarray_like(read_only, like=like)), read_only)
+
+
+def test_values_like(library):
+    xp = namespace_of_library(library)
+    target = xp.zeros(3, dtype=xp.float64)
+
+    # Python scalars are passed on as they are
+    for scalar in (2.5, 3, True):
+        assert values_like(scalar, target) is scalar
+
+    # a list goes straight to the data type of the target, not through PyTorch's default float32
+    precise = [0.1, 1.0 + 1e-12, 1e10 + 0.5]
+    converted = values_like(precise, target)
+    assert converted.dtype == target.dtype
+    assert_gathered(converted, library, np.array(precise))
+    target[...] = converted
+    assert_gathered(target, library, np.array(precise))
+
+    # arrays of other data types, NumPy scalars, and read-only host arrays
+    converted = values_like(np.array([1, 2, 3], dtype=np.int32), target)
+    assert converted.dtype == target.dtype
+    assert_gathered(converted, library, np.array([1.0, 2.0, 3.0]))
+    converted = values_like(np.float32(1.5), target)
+    assert array_namespace(converted) is xp and converted.dtype == target.dtype and converted.shape == ()
+    read_only = np.array([4.0, 5.0, 6.0])
+    read_only.flags.writeable = False
+    converted = values_like(read_only, target)
+    assert_gathered(converted, library, read_only)
+    if library is not np:
+        assert not np.shares_memory(to_numpy(converted), read_only)
+    assert device_of(converted) == device_of(target)
+
+
+def test_cached_per_placement_converts_once_per_library_and_device(library):
+    host_values = np.arange(4.0)
+    copies = []
+    conversions = []
+
+    def convert(like):
+        conversions.append(like)
+        return asarray_like(host_values, like=like)
+
+    first = cached_per_placement(copies, as_library(library, [0.0]), convert)
+    assert cached_per_placement(copies, as_library(library, [1.0, 2.0]), convert) is first
+    assert_gathered(first, library, host_values)
+    assert len(conversions) == 1
+
+    # NumPy arrays and values that are not arrays (which NumPy takes as they are) have entries of their own
+    numpy_copy = cached_per_placement(copies, np.zeros(2), convert)
+    not_an_array_copy = cached_per_placement(copies, 0.5, convert)
+    assert isinstance(numpy_copy, np.ndarray) and isinstance(not_an_array_copy, np.ndarray)
+    assert cached_per_placement(copies, 1.5, convert) is not_an_array_copy
+    assert len(copies) == len(conversions) == (2 if library is np else 3)
+
+
+def test_nbytes_of(library):
+    xp = namespace_of_library(library)
+    for dtype_name, itemsize in [("bool", 1), ("int8", 1), ("int32", 4), ("float32", 4), ("float64", 8), ("complex128", 16)]:
+        assert nbytes_of(xp.zeros((3, 5), dtype=getattr(xp, dtype_name))) == 15 * itemsize, dtype_name
+    assert nbytes_of(None) == 0
+    assert nbytes_of([1.0, 2.0]) == 0
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+@pytest.mark.parametrize(
+    "indices",
+    [[0, 3], [-1, 2, -6], [4, 4, 1], [], [[0, 1], [5, -1]]],
+    ids=["positive", "negative", "repeated", "empty", "two-dimensional"],
+)
+def test_indices_to_mask_matches_numpy_scatter(library, indices, dtype):
+    indices = np.asarray(indices, dtype=dtype)
+    expected = np.zeros(6, dtype=bool)
+    expected[indices] = True
+
+    mask = indices_to_mask(as_library(library, indices), 6)
+
+    assert_gathered(mask, library, expected)
+
+
+@pytest.mark.parametrize("out_of_bounds", [6, -7, 100])
+def test_indices_to_mask_raises_the_numpy_index_error(library, out_of_bounds):
+    indices = np.array([1, out_of_bounds, 2])
+    with pytest.raises(IndexError) as numpy_error:
+        np.zeros(6, dtype=bool)[indices] = True
+
+    with pytest.raises(IndexError, match=f"^{numpy_error.value}$"):
+        indices_to_mask(as_library(library, indices), 6)

@@ -276,6 +276,22 @@ def test_constant_field_matches_numpy(xp):
     _assert_matches_numpy(result, expected, xp)
 
 
+@pytest.mark.parametrize("value", [2.5, np.float32(1.25), -0.0], ids=["float64", "float32", "negative-zero"])
+@pytest.mark.parametrize("position_dtype", [np.float32, np.float64])
+def test_constant_field_is_the_value_converted_to_the_library(xp, value, position_dtype):
+    """The value, filled where the positions are, promotes with them as the value converted from the host does."""
+    fieldset = FieldSet.from_sgrid_conventions(_scalar_dataset())
+    fieldset.add_constant_field("K", value)
+    x = xp.asarray(np.linspace(0.5, 4.5, 7).astype(position_dtype))
+    expected = asarray_like(fieldset.K.data[0, 0, 0, 0].values, like=x) * xp.ones_like(x)
+
+    result = fieldset.K.interp_method.interp({"x": x}, {}, fieldset.K)
+
+    assert array_namespace(result) is xp
+    assert result.dtype == expected.dtype
+    assert to_numpy(result).tobytes() == to_numpy(expected).tobytes()
+
+
 def _corner_levels(npart: int) -> dict:
     rng = np.random.default_rng(4)
     ti = rng.integers(0, 5, npart)

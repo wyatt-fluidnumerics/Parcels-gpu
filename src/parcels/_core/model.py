@@ -13,12 +13,18 @@ from dask import is_dask_collection
 import parcels._sgrid as sgrid
 import parcels._typing as ptyping
 from parcels._chunk_cached_array import wrap_dataset
-from parcels._chunk_cached_array.core import _placement_of_library
 from parcels._core.basegrid import BaseGrid
 from parcels._core.field import Field, VectorField
 from parcels._core.mesh import FlatMesh, SphericalMesh, _infer_mesh_from_coordinates
-from parcels._core.utils.array_backend import NUMPY_PLACEMENT, ArrayPlacement, is_array
-from parcels._core.utils.time import TimeInterval
+from parcels._core.utils.array_backend import (
+    NUMPY_PLACEMENT,
+    ArrayPlacement,
+    asarray_like,
+    cached_per_placement,
+    is_array,
+    placement_of_library,
+)
+from parcels._core.utils.time import TimeInterval, timedelta_to_float
 from parcels._core.uxgrid import UxGrid
 from parcels._core.xgrid import (
     XGrid,
@@ -101,7 +107,7 @@ class ModelData(ABC):
         return placements.pop() if placements else NUMPY_PLACEMENT
 
     def _assert_supports_array_library(self, array_library: ModuleType | None, device: Any, backend: str) -> None:
-        if _placement_of_library(array_library, device) == NUMPY_PLACEMENT:
+        if placement_of_library(array_library, device) == NUMPY_PLACEMENT:
             return
         if not isinstance(self.grid, XGrid):
             raise NotImplementedError(
@@ -224,6 +230,22 @@ class ModelData(ABC):
             )
             raise e
         return time_interval
+
+    def _time_axis_seconds_like(self, like: Any) -> Any:
+        """The time coordinate in seconds since the start of ``time_interval``, in the array library and on the device of ``like``.
+
+        Every field of the model shares this time coordinate. It is converted once per array library and device,
+        and again after the time coordinate is replaced.
+        """
+        time_coordinate = self.data.variables["time"]
+        if self.__dict__.get("_time_axis_source") is not time_coordinate:
+            self._time_axis_source = time_coordinate
+            self._time_axis_copies: list[tuple[ModuleType, Any, Any]] = []
+        return cached_per_placement(
+            self._time_axis_copies,
+            like,
+            lambda like: asarray_like(timedelta_to_float(self.data["time"].data - self.time_interval.left), like=like),
+        )
 
 
 def preprocess_sgrid_model_data(ds: xr.Dataset) -> xr.Dataset:

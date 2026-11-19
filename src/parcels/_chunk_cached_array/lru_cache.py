@@ -1,30 +1,10 @@
 from __future__ import annotations
 
-import math
 from collections import OrderedDict
 from collections.abc import Hashable
 from typing import Any
 
-from parcels._core.utils.array_backend import array_namespace
-
-
-def _nbytes(array: Any) -> int:
-    """Size of ``array`` in bytes, also for array types without an ``nbytes`` attribute."""
-    nbytes = getattr(array, "nbytes", None)
-    if nbytes is not None:
-        return int(nbytes)
-    xp = array_namespace(array)
-    dtype = array.dtype
-    if xp.isdtype(dtype, "bool"):
-        itemsize = 1
-    elif xp.isdtype(dtype, "integral"):
-        itemsize = xp.iinfo(dtype).bits // 8
-    elif xp.isdtype(dtype, "real floating"):
-        itemsize = xp.finfo(dtype).bits // 8
-    else:
-        # finfo describes one component of a complex number
-        itemsize = 2 * xp.finfo(dtype).bits // 8
-    return math.prod(array.shape) * itemsize
+from parcels._core.utils.array_backend import nbytes_of
 
 
 class ByteBoundedLRUCache:
@@ -51,16 +31,16 @@ class ByteBoundedLRUCache:
         return self._cache[key]
 
     def put(self, key: Hashable, value: Any) -> None:
-        nbytes = _nbytes(value)
+        nbytes = nbytes_of(value)
         if nbytes > self._max_bytes:
             return
         # Remove existing entry if present (will be re-inserted at end)
         if key in self._cache:
-            self._current_bytes -= _nbytes(self._cache.pop(key))
+            self._current_bytes -= nbytes_of(self._cache.pop(key))
         # Evict LRU entries until there's room
         while self._current_bytes + nbytes > self._max_bytes:
             _, evicted = self._cache.popitem(last=False)
-            self._current_bytes -= _nbytes(evicted)
+            self._current_bytes -= nbytes_of(evicted)
         self._cache[key] = value
         self._current_bytes += nbytes
 
