@@ -5,12 +5,14 @@ See `this tutorial <./example_diffusion.ipynb>`__ for a detailed explanation.
 
 import numpy as np
 
+from parcels._core.utils.array_backend import array_namespace, asarray_like, to_numpy
+
 __all__ = ["AdvectionDiffusionEM", "AdvectionDiffusionM1", "DiffusionUniformKh"]
 
 
 def meters_to_degrees_zonal(deg, lat, deg2m):  # pragma: no cover
     """Convert square meters to square degrees longitude at a given latitude."""
-    return deg / pow(deg2m * np.cos(lat * np.pi / 180), 2)
+    return deg / pow(deg2m * array_namespace(lat).cos(lat * np.pi / 180), 2)
 
 
 def meters_to_degrees_meridional(deg, deg2m):  # pragma: no cover
@@ -33,9 +35,10 @@ def AdvectionDiffusionM1(particles, fieldset):  # pragma: no cover
     The Wiener increment `dW` is normally distributed with zero
     mean and a standard deviation of sqrt(dt).
     """
-    # Wiener increment with zero mean and std of sqrt(dt)
-    dWx = np.random.normal(0, np.sqrt(np.fabs(particles.dt)))
-    dWy = np.random.normal(0, np.sqrt(np.fabs(particles.dt)))
+    xp = array_namespace(particles.x)
+    # Wiener increment with zero mean and std of sqrt(dt), drawn from NumPy's global random state
+    dWx = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
+    dWy = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
 
     Kxp1 = fieldset.Kh_zonal[particles.t, particles.z, particles.y, particles.x + fieldset.dres, particles]
     Kxm1 = fieldset.Kh_zonal[particles.t, particles.z, particles.y, particles.x - fieldset.dres, particles]
@@ -48,7 +51,7 @@ def AdvectionDiffusionM1(particles, fieldset):  # pragma: no cover
     kh_zonal = fieldset.Kh_zonal[particles.t, particles.z, particles.y, particles.x, particles]
     if fieldset.Kh_zonal.grid.mesh.is_spherical():
         kh_zonal = meters_to_degrees_zonal(kh_zonal, particles.y, fieldset.Kh_zonal.grid.deg2m)
-    bx = np.sqrt(2 * kh_zonal)
+    bx = xp.sqrt(2 * kh_zonal)
 
     Kyp1 = fieldset.Kh_meridional[particles.t, particles.z, particles.y + fieldset.dres, particles.x, particles]
     Kym1 = fieldset.Kh_meridional[particles.t, particles.z, particles.y - fieldset.dres, particles.x, particles]
@@ -60,11 +63,11 @@ def AdvectionDiffusionM1(particles, fieldset):  # pragma: no cover
     kh_meridional = fieldset.Kh_meridional[particles.t, particles.z, particles.y, particles.x, particles]
     if fieldset.Kh_meridional.grid.mesh.is_spherical():
         kh_meridional = meters_to_degrees_meridional(kh_meridional, fieldset.Kh_meridional.grid.deg2m)
-    by = np.sqrt(2 * kh_meridional)
+    by = xp.sqrt(2 * kh_meridional)
 
     # Particle positions are updated only after evaluating all terms.
-    particles.dx += u * particles.dt + 0.5 * dKdx * (dWx**2 + particles.dt) + bx * dWx
-    particles.dy += v * particles.dt + 0.5 * dKdy * (dWy**2 + particles.dt) + by * dWy
+    particles.dx = particles.dx + (u * particles.dt + 0.5 * dKdx * (dWx**2 + particles.dt) + bx * dWx)
+    particles.dy = particles.dy + (v * particles.dt + 0.5 * dKdy * (dWy**2 + particles.dt) + by * dWy)
 
 
 def AdvectionDiffusionEM(particles, fieldset):  # pragma: no cover
@@ -80,9 +83,10 @@ def AdvectionDiffusionEM(particles, fieldset):  # pragma: no cover
     The Wiener increment `dW` is normally distributed with zero
     mean and a standard deviation of sqrt(dt).
     """
-    # Wiener increment with zero mean and std of sqrt(dt)
-    dWx = np.random.normal(0, np.sqrt(np.fabs(particles.dt)))
-    dWy = np.random.normal(0, np.sqrt(np.fabs(particles.dt)))
+    xp = array_namespace(particles.x)
+    # Wiener increment with zero mean and std of sqrt(dt), drawn from NumPy's global random state
+    dWx = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
+    dWy = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
 
     u, v = fieldset.UV[particles.t, particles.z, particles.y, particles.x, particles]
 
@@ -97,7 +101,7 @@ def AdvectionDiffusionEM(particles, fieldset):  # pragma: no cover
     kh_zonal = fieldset.Kh_zonal[particles.t, particles.z, particles.y, particles.x, particles]
     if fieldset.Kh_zonal.grid.mesh.is_spherical():
         kh_zonal = meters_to_degrees_zonal(kh_zonal, particles.y, fieldset.Kh_zonal.grid.deg2m)
-    bx = np.sqrt(2 * kh_zonal)
+    bx = xp.sqrt(2 * kh_zonal)
 
     Kyp1 = fieldset.Kh_meridional[particles.t, particles.z, particles.y + fieldset.dres, particles.x, particles]
     Kym1 = fieldset.Kh_meridional[particles.t, particles.z, particles.y - fieldset.dres, particles.x, particles]
@@ -110,11 +114,11 @@ def AdvectionDiffusionEM(particles, fieldset):  # pragma: no cover
     kh_meridional = fieldset.Kh_meridional[particles.t, particles.z, particles.y, particles.x, particles]
     if fieldset.Kh_meridional.grid.mesh.is_spherical():
         kh_meridional = meters_to_degrees_meridional(kh_meridional, fieldset.Kh_meridional.grid.deg2m)
-    by = np.sqrt(2 * kh_meridional)
+    by = xp.sqrt(2 * kh_meridional)
 
     # Particle positions are updated only after evaluating all terms.
-    particles.dx += ax * particles.dt + bx * dWx
-    particles.dy += ay * particles.dt + by * dWy
+    particles.dx = particles.dx + (ax * particles.dt + bx * dWx)
+    particles.dy = particles.dy + (ay * particles.dt + by * dWy)
 
 
 def DiffusionUniformKh(particles, fieldset):  # pragma: no cover
@@ -135,9 +139,10 @@ def DiffusionUniformKh(particles, fieldset):  # pragma: no cover
     The Wiener increment `dW` is normally distributed with zero
     mean and a standard deviation of sqrt(dt).
     """
-    # Wiener increment with zero mean and std of sqrt(dt)
-    dWx = np.random.normal(0, np.sqrt(np.fabs(particles.dt)))
-    dWy = np.random.normal(0, np.sqrt(np.fabs(particles.dt)))
+    xp = array_namespace(particles.x)
+    # Wiener increment with zero mean and std of sqrt(dt), drawn from NumPy's global random state
+    dWx = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
+    dWy = asarray_like(np.random.normal(0, np.sqrt(np.fabs(to_numpy(particles.dt)))), like=particles.dt)
 
     kh_zonal = fieldset.Kh_zonal[particles]
     kh_meridional = fieldset.Kh_meridional[particles]
@@ -146,8 +151,8 @@ def DiffusionUniformKh(particles, fieldset):  # pragma: no cover
         kh_zonal = meters_to_degrees_zonal(kh_zonal, particles.y, fieldset.Kh_zonal.grid.deg2m)
         kh_meridional = meters_to_degrees_meridional(kh_meridional, fieldset.Kh_meridional.grid.deg2m)
 
-    bx = np.sqrt(2 * kh_zonal)
-    by = np.sqrt(2 * kh_meridional)
+    bx = xp.sqrt(2 * kh_zonal)
+    by = xp.sqrt(2 * kh_meridional)
 
-    particles.dx += bx * dWx
-    particles.dy += by * dWy
+    particles.dx = particles.dx + bx * dWx
+    particles.dy = particles.dy + by * dWy

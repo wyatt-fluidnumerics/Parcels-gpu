@@ -17,7 +17,7 @@ import parcels
 from parcels._core.mesh import BaseMesh
 from parcels._core.particle import ParticleClass
 from parcels._core.particlesetview import ParticleSetView
-from parcels._core.utils.array_backend import to_numpy
+from parcels._core.utils.array_backend import array_namespace, asarray_like, atleast_1d, flatnonzero, to_numpy
 from parcels._core.utils.time import timedelta_to_float
 from parcels._repr_utils import particlefile_repr
 from parcels._typing import PathLike
@@ -175,15 +175,17 @@ class ParticleFile:
             t = timedelta_to_float(t - self._time_interval.left)
         vars_to_write = _get_vars_to_write(pclass)
         if indices is not None:
-            indices_to_write = indices
+            indices_to_write = asarray_like(indices, like=particle_data["particle_id"])
         elif isinstance(pset, ParticleSetView):
             # A view already selects the particles to write, so `t` is not used to filter
-            indices_to_write = np.flatnonzero(pset._index)
+            indices_to_write = None
         else:
             indices_to_write = _to_write_particles(particle_data, t)
 
         self._writer.write_table(
-            pa.table({v.name: pa.array(to_numpy(particle_data[v.name][indices_to_write])) for v in vars_to_write}),
+            pa.table(
+                {v.name: pa.array(to_numpy(_rows_to_write(pset, v.name, indices_to_write))) for v in vars_to_write}
+            ),
         )
 
     def close(self):
@@ -202,19 +204,29 @@ def _get_vars_to_write(particle: ParticleClass) -> list[Variable]:
     return [v for v in particle.variables if v.to_write is not False]
 
 
+def _rows_to_write(pset, name, indices):
+    """The values of variable `name` to write: the rows `indices` of the particle data, or all rows of a view."""
+    if indices is None:
+        return atleast_1d(getattr(pset, name))
+    return pset._data[name][indices]
+
+
 def _to_write_particles(particle_data, t):
     """Return the Particles that need to be written at time: if particle.t is between time-dt/2 and time+dt (/2)"""
     particle_t = particle_data["t"]
-    half_dt = np.abs(particle_data["dt"] / 2)
-    # Comparisons with a non-finite particle t are discarded by the np.isfinite(particle_t) term
-    return np.where(
+    xp = array_namespace(particle_t)
+    # A NumPy scalar time would turn particle arrays of other libraries into NumPy arrays
+    t = float(t)
+    half_dt = xp.abs(particle_data["dt"] / 2)
+    # Comparisons with a non-finite particle t are discarded by the xp.isfinite(particle_t) term
+    return flatnonzero(
         (
             ((t - half_dt <= particle_t) & (t + half_dt >= particle_t))  # check t - dt/2 <= particle_t <= t + dt/2
-            | (np.isnan(particle_data["dt"]) & (t == particle_t))  # or dt is NaN and t matches particle_t
+            | (xp.isnan(particle_data["dt"]) & (t == particle_t))  # or dt is NaN and t matches particle_t
         )
-        & (np.isfinite(particle_data["particle_id"]))
-        & (np.isfinite(particle_t))
-    )[0]
+        & (xp.isfinite(particle_data["particle_id"]))
+        & (xp.isfinite(particle_t))
+    )
 
 
 def read_particlefile(path: PathLike, decode_times: bool = True) -> pd.DataFrame:

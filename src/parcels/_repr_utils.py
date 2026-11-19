@@ -12,6 +12,7 @@ from dask.base import is_dask_collection
 
 from parcels._chunk_cached_array.core import ChunkCachedArray
 from parcels._core._windowed_array import WindowedArray
+from parcels._core.utils.array_backend import to_numpy
 from parcels._gpu_array.core import GpuArray
 
 if TYPE_CHECKING:
@@ -104,10 +105,18 @@ def particleset_repr(pset: ParticleSet) -> str:
 
 def particlesetview_repr(pview: Any) -> str:
     """Return a pretty repr for ParticleSetView"""
-    out = f"P[{pview.particle_id}]: t={pview.t:f}, z={pview.z:f}, y={pview.y:f}, x={pview.x:f}"
+
+    def value_of(name: str):
+        # A NumPy scalar formats the same whatever library the particle data is in
+        return to_numpy(getattr(pview, name))[()]
+
+    out = (
+        f"P[{value_of('particle_id')}]: t={value_of('t'):f}, z={value_of('z'):f}, "
+        f"y={value_of('y'):f}, x={value_of('x'):f}"
+    )
     vars = [v.name for v in pview._pclass.variables if v.to_write is True and v.name not in ["t", "z", "y", "x"]]
     for var in vars:
-        out += f", {var}={getattr(pview, var)}"
+        out += f", {var}={value_of(var)}"
 
     return textwrap.dedent(out).strip()
 

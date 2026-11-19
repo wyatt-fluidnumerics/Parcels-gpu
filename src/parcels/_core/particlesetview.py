@@ -1,38 +1,61 @@
+import weakref
+
 import numpy as np
 
-from parcels._core.utils.array_backend import array_namespace, is_array
+from parcels._core.utils.array_backend import array_namespace, asarray_like, device_of, flatnonzero, is_array
 from parcels._repr_utils import particlesetview_repr
+
+_VIEW_ATTRIBUTES = ("_data", "_index", "_pclass", "_parent", "_arrays", "_sources", "_write_backs")
 
 
 class ParticleSetView:
-    """Class to be used in a kernel that links a View of the ParticleSet (on the kernel level) to a ParticleSet."""
+    """Class to be used in a kernel that links a View of the ParticleSet (on the kernel level) to a ParticleSet.
 
-    def __init__(self, data, index, pclass):
+    Reading a variable gathers the selected particles' values into an array of the compute library,
+    which the view keeps and hands out on every further read. Assigning a variable writes through to
+    the ParticleSet at once. Changes made in place to a handed-out array reach the ParticleSet when
+    the view writes back: on assignment of that variable, when `_write_back` is called (the kernel
+    loop does so after every kernel), and otherwise as soon as nothing holds the array any more.
+
+    A view of a view (``particles[mask]`` inside a kernel) gathers from, and writes back to, the
+    arrays of the view it was taken from, so neither ever holds values older than what the other wrote.
+    """
+
+    def __init__(self, data, index, pclass, parent=None):
         self._data = data
-        self._index = index
+        self._index = index if parent is not None else _normalize_index(index, data["particle_id"])
         self._pclass = pclass
+        self._parent = parent
+        self._arrays = {}
+        self._sources = {}
+        self._write_backs = {}
 
     def __getattr__(self, name):
-        # Return a proxy that behaves like the underlying numpy array but
-        # writes back into the parent arrays when sliced/modified. This
-        # enables constructs like `particles.dlon[mask] += vals` to update
-        # the parent arrays rather than temporary copies.
+        if name in _VIEW_ATTRIBUTES:
+            raise AttributeError(name)
         if name in self._data:
             # If this ParticleSetView represents a single particle (integer
             # index), return the underlying scalar directly to preserve
             # user-facing semantics (e.g., `pset[0].time` should be a number).
-            if isinstance(self._index, (int, np.integer)):
-                return self._data[name][self._index]
-            if is_array(self._index) and self._index.ndim == 0:
-                return self._data[name][int(self._index)]
-            return ParticleSetViewArray(self._data, self._index, name)
+            if isinstance(self._index, int):
+                return _gather_rows(self._data[name], self._index)
+            return self._get(name)
         return self._data[name][self._index]
 
     def __setattr__(self, name, value):
-        if name in ["_data", "_index", "_pclass"]:
+        if name in _VIEW_ATTRIBUTES:
             object.__setattr__(self, name, value)
+        elif isinstance(self._index, int):
+            target = self._data[name]
+            _put_rows(target, self._index, _values_like(value, target))
+        elif name in self._arrays:
+            array = self._arrays[name]
+            if value is not array:
+                array[...] = _values_like(value, array)
+            self._write_back_variable(name)
         else:
-            self._data[name][self._index] = value
+            source = self._source(name)
+            _write_rows_to(self._owner(), name, source, self._index, _values_like(value, source))
 
     def __repr__(self):
         return particlesetview_repr(self)
@@ -41,282 +64,204 @@ class ParticleSetView:
         # normalize single-element tuple indexing (e.g., (inds,))
         if isinstance(index, tuple) and len(index) == 1:
             index = index[0]
+        if isinstance(self._index, int):
+            raise TypeError("A ParticleSetView of a single particle cannot be indexed.")
 
-        base = self._index
-        xp = array_namespace(base)
-        new_index = np.zeros_like(base, dtype=bool)
+        reference = self._data["particle_id"]
+        xp = array_namespace(reference)
+        nselected = self._size()
 
         # Boolean mask (could be local-length or global-length)
-        if _is_array_or_list(index) and xp.asarray(index).dtype == bool:
-            arr = xp.asarray(index)
-            if arr.size == base.size:
-                # global mask
-                new_index = arr
-            elif arr.size == int(np.sum(base)):
-                new_index[base] = arr
-            else:
-                raise ValueError(
-                    f"Boolean index has incompatible length {arr.size} for selection of size {int(np.sum(base))}"
-                )
-            return ParticleSetView(self._data, new_index, self._pclass)
+        if _is_array_or_list(index):
+            index = asarray_like(index, like=reference)
+            if index.dtype == xp.bool:
+                if index.shape[0] == reference.shape[0]:
+                    # global mask
+                    local_mask = self._select(index)
+                elif index.shape[0] == nselected:
+                    local_mask = index
+                else:
+                    raise ValueError(
+                        f"Boolean index has incompatible length {index.shape[0]} for selection of size {nselected}"
+                    )
+                return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
 
         # Integer array/list, slice or single integer relative to the local view
-        # (boolean masks were handled above). Normalize and map to global
-        # particle indices for both boolean-base and integer-base `self._index`.
-        if _is_array_or_list(index) or isinstance(index, (slice, int)):
-            # convert list/ndarray to ndarray, keep slice/int as-is
-            idx = xp.asarray(index) if _is_array_or_list(index) else index
-            if base.dtype == bool:
-                particle_idxs = np.flatnonzero(base)
-                sel = particle_idxs[idx]
-            else:
-                base_arr = xp.asarray(base)
-                sel = base_arr[idx]
-            new_index[sel] = True
-            return ParticleSetView(self._data, new_index, self._pclass)
+        # (boolean masks were handled above). A view of a view selects with a
+        # boolean mask over the particles of the view it is taken from.
+        if is_array(index):
+            _raise_if_out_of_bounds(index, nselected)
+            positions = xp.astype(xp.where(index < 0, index + nselected, index), xp.int64)
+            local_mask = xp.isin(xp.arange(nselected, dtype=xp.int64, device=device_of(reference)), positions)
+            return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
+        local_mask = xp.zeros(nselected, dtype=xp.bool, device=device_of(reference))
+        if isinstance(index, (slice, int)):
+            local_mask[index] = True
+            return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
 
         # Fallback: try to assign directly (preserves previous behaviour for other index types)
         try:
-            new_index[base] = index
-            return ParticleSetView(self._data, new_index, self._pclass)
+            local_mask[...] = index
+            return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
         except Exception as e:
             raise TypeError(f"Unsupported index type for ParticleSetView.__getitem__: {type(index)!r}") from e
 
     def __len__(self):
+        if self._parent is not None:
+            return len(self._parent)
+        if is_array(self._index):
+            return self._index.shape[0]
         return len(self._index)
+
+    def _owner(self):
+        """Where this view's selection points into: the enclosing view, or the ParticleSet's data."""
+        return self._data if self._parent is None else self._parent
+
+    def _source(self, name):
+        """The array of `name` that this view's selection indexes."""
+        if self._parent is None:
+            return self._data[name]
+        return self._parent._get(name)
+
+    def _get(self, name):
+        """The array of `name` for the selected particles, gathered on first use."""
+        array = self._arrays.get(name)
+        if array is None:
+            source = self._source(name)
+            gathered = _gather_rows(source, self._index)
+            # The view hands out an alias of the gathered array, so that once the view and every user
+            # have let go of it, the finalizer can still write the gathered values back.
+            array = gathered[...]
+            write_back = weakref.finalize(array, _write_rows_to, self._owner(), name, source, self._index, gathered)
+            write_back.atexit = False
+            self._arrays[name] = array
+            self._sources[name] = source
+            self._write_backs[name] = write_back
+        return array
+
+    def _write_back_variable(self, name):
+        """Write the array gathered for `name` into the view's parent, and from there up to the ParticleSet."""
+        _write_rows_to(self._owner(), name, self._sources[name], self._index, self._arrays[name])
+
+    def _write_back(self):
+        """Write every gathered array back to the ParticleSet and let go of them, so the next read gathers again."""
+        for name in list(self._arrays):
+            self._write_back_variable(name)
+            self._write_backs[name].detach()
+        self._arrays.clear()
+        self._sources.clear()
+        self._write_backs.clear()
+
+    def _size(self):
+        """Number of particles that this view selects."""
+        if isinstance(self._index, slice):
+            return len(range(*self._index.indices(self._data["particle_id"].shape[0])))
+        if self._index.dtype == array_namespace(self._index).bool:
+            return int(array_namespace(self._index).count_nonzero(self._index))
+        return self._index.shape[0]
+
+    def _select(self, values):
+        """The entries of `values`, which has one entry per particle in the ParticleSet, that this view selects."""
+        if self._parent is not None:
+            values = self._parent._select(values)
+        return _gather_rows(values, self._index)
 
 
 def _is_array_or_list(index) -> bool:
     return is_array(index) or isinstance(index, list)
 
 
-def _unwrap(other):
-    """Return ndarray for ParticleSetViewArray or the value unchanged."""
-    return other.__array__() if isinstance(other, ParticleSetViewArray) else other
+def _is_integer_array(index) -> bool:
+    return is_array(index) and array_namespace(index).isdtype(index.dtype, "integral")
 
 
-def _unwrap_nested(argument):
-    """Unwrap ParticleSetViewArrays that are passed directly or inside a list or tuple."""
-    if isinstance(argument, (list, tuple)):
-        return type(argument)(_unwrap_nested(item) for item in argument)
-    return _unwrap(argument)
+def _normalize_index(index, reference):
+    """A ParticleSet index as a Python int (a single particle), a slice, or an array of the library of `reference`.
+
+    Negative entries of integer arrays are wrapped, since not every library gathers with them.
+    """
+    if isinstance(index, tuple) and len(index) == 1:
+        index = index[0]
+    if isinstance(index, np.integer) or (is_array(index) and index.ndim == 0):
+        return int(index)
+    if _is_array_or_list(index):
+        index = asarray_like(index, like=reference)
+        if _is_integer_array(index):
+            index = array_namespace(index).where(index < 0, index + reference.shape[0], index)
+    return index
 
 
-def _asarray(other):
-    """Return the selected array for ParticleSetViewArray, otherwise return argument."""
-    return other.__array__() if isinstance(other, ParticleSetViewArray) else other
+def _raise_if_out_of_bounds(indices, size: int):
+    """Raise the IndexError NumPy raises for integer `indices` into an axis of length `size`."""
+    xp = array_namespace(indices)
+    out_of_bounds = (indices < -size) | (indices >= size)
+    if bool(xp.any(out_of_bounds)):
+        first = int(xp.reshape(indices, (-1,))[flatnonzero(xp.reshape(out_of_bounds, (-1,)))[0]])
+        raise IndexError(f"index {first} is out of bounds for axis 0 with size {size}")
 
 
-class ParticleSetViewArray:
-    """Array-like proxy for a ParticleSetView that writes through to the parent arrays when mutated."""
+def _values_like(value, target):
+    """`value` ready to be assigned into `target`: an array of the library, device and data type of `target`.
 
-    def __init__(self, data, index, name):
-        self._data = data
-        self._index = index
-        self._name = name
+    Python scalars are passed on as they are.
+    """
+    if not is_array(value) and isinstance(value, (bool, int, float, complex)):
+        return value
+    value = asarray_like(value, like=target)
+    if value.dtype != target.dtype:
+        value = array_namespace(target).astype(value, target.dtype)
+    return value
 
-    def __array__(self, dtype=None):
-        arr = self._data[self._name][self._index]
-        return arr.astype(dtype) if dtype is not None else arr
 
-    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
-        if any(isinstance(out, ParticleSetViewArray) for out in kwargs.get("out", ())):
-            return NotImplemented
-        return getattr(ufunc, method)(*(_unwrap(value) for value in inputs), **kwargs)
+def _gather_rows(source, index):
+    """The rows of `source` (one row per particle) that `index` selects."""
+    if _is_integer_array(index):
+        return array_namespace(source).take(source, index, axis=0)
+    if source.ndim > 1 and not is_array(index):
+        return source[index, ...]
+    return source[index]
 
-    def __array_function__(self, func, types, args, kwargs):
-        return func(*_unwrap_nested(args), **{name: _unwrap_nested(value) for name, value in kwargs.items()})
 
-    def __repr__(self):
-        return repr(self.__array__())
+def _put_rows(target, index, values):
+    """Assign `values` to the rows of `target` that `index` selects.
 
-    def __len__(self):
-        return len(self.__array__())
+    Rows selected by an integer array are assigned through the equivalent boolean mask, as not every
+    library assigns through integer arrays. A row selected more than once gets its last value, as in NumPy.
+    """
+    if not _is_integer_array(index):
+        if target.ndim > 1 and not is_array(index):
+            target[index, ...] = values
+        else:
+            target[index] = values
+        return
 
-    def _to_global_index(self, subindex=None):
-        """Return a global index (boolean mask or integer indices) that
-        addresses the parent arrays. If `subindex` is provided it selects
-        within the current local view and maps back to the global index.
-        """
-        base = self._index
-        if subindex is None:
-            return base
-        xp = array_namespace(base)
+    xp = array_namespace(target)
+    nselected = index.shape[0]
+    if nselected == 0:
+        return
+    values = xp.asarray(values, dtype=target.dtype, device=device_of(target))
+    values = xp.broadcast_to(values, (nselected, *target.shape[1:]))
+    order = xp.argsort(index, stable=True)
+    sorted_rows = xp.take(index, order)
+    all_rows = xp.arange(target.shape[0], dtype=index.dtype, device=device_of(target))
+    last_selection = xp.searchsorted(sorted_rows, all_rows, side="right") - 1
+    is_selected = last_selection >= 0
+    last_selection = xp.where(is_selected, last_selection, 0)
+    is_selected = is_selected & (xp.take(sorted_rows, last_selection) == all_rows)
+    target[is_selected] = xp.take(values, xp.take(order, last_selection[is_selected]), axis=0)
 
-        # If subindex is a boolean array, support both local-length masks
-        # (length == base.sum()) and global-length masks (length == base.size).
-        if _is_array_or_list(subindex) and xp.asarray(subindex).dtype == bool:
-            arr = xp.asarray(subindex)
-            if arr.size == base.size:
-                # already a global mask
-                return arr
-            if arr.size == int(np.sum(base)):
-                global_mask = np.zeros_like(base, dtype=bool)
-                global_mask[base] = arr
-                return global_mask
-            raise ValueError(
-                f"Boolean index has incompatible length {arr.size} for selection of size {int(np.sum(base))}"
-            )
 
-        # Handle tuple indexing where the first axis indexes particles
-        # and later axes index into the per-particle array shape (e.g. ei[:, igrid])
-        if isinstance(subindex, tuple):
-            first, *rest = subindex
-            # map the first index (local selection) to global particle indices
-            if base.dtype == bool:
-                particle_idxs = np.flatnonzero(base)
-                first_arr = xp.asarray(first) if _is_array_or_list(first) else first
-                sel = particle_idxs[first_arr]
-            else:
-                base_arr = xp.asarray(base)
-                sel = base_arr[first]
+def _write_rows_to(owner, name, source, index, values):
+    """Write `values` into the rows `index` of `source`, which is `owner`'s array of `name`.
 
-            # if rest contains a single int (e.g., column), return tuple index
-            if len(rest) == 1:
-                return (sel, rest[0])
-            # return full tuple (sel, ...) for higher-dim cases
-            return tuple([sel] + rest)
-
-        # If base is a boolean mask over the parent array and subindex is
-        # an integer or slice relative to the local view, map it to integer
-        # indices in the parent array.
-        if base.dtype == bool:
-            if isinstance(subindex, (slice, int)):
-                rel = np.flatnonzero(base)[subindex]
-                return rel
-            # If subindex is an integer/array selection (relative to the
-            # local view) map those to global integer indices.
-            arr = xp.asarray(subindex)
-            if arr.dtype != bool:
-                particle_idxs = np.flatnonzero(base)
-                sel = particle_idxs[arr]
-                return sel
-            # Otherwise treat subindex as a boolean mask relative to the
-            # local view and expand to a global boolean mask.
-            global_mask = np.zeros_like(base, dtype=bool)
-            global_mask[base] = arr
-            return global_mask
-
-        # If base is an array of integer indices
-        base_arr = xp.asarray(base)
-        try:
-            return base_arr[subindex]
-        except Exception:
-            return base_arr[xp.asarray(subindex, dtype=bool)]
-
-    def __getitem__(self, subindex):
-        # Handle tuple indexing (e.g. [:, igrid]) by applying the tuple
-        # to the local selection first. This covers the common case
-        # `particles.ei[:, igrid]` where `ei` is a 2D parent array and the
-        # second index selects the grid index.
-        if isinstance(subindex, tuple):
-            local = self._data[self._name][self._index]
-            return local[subindex]
-
-        new_index = self._to_global_index(subindex)
-        return ParticleSetViewArray(self._data, new_index, self._name)
-
-    def __setitem__(self, subindex, value):
-        tgt = self._to_global_index(subindex)
-        self._data[self._name][tgt] = value
-
-    # in-place ops must write back into the parent array
-    def __iadd__(self, other):
-        vals = self._data[self._name][self._index] + _unwrap(other)
-        self._data[self._name][self._index] = vals
-        return self
-
-    def __isub__(self, other):
-        vals = self._data[self._name][self._index] - _unwrap(other)
-        self._data[self._name][self._index] = vals
-        return self
-
-    def __imul__(self, other):
-        vals = self._data[self._name][self._index] * _unwrap(other)
-        self._data[self._name][self._index] = vals
-        return self
-
-    # Provide simple numpy-like evaluation for binary ops by delegating to ndarray
-    def __add__(self, other):
-        return self.__array__() + _unwrap(other)
-
-    def __sub__(self, other):
-        return self.__array__() - _unwrap(other)
-
-    def __mul__(self, other):
-        return self.__array__() * _unwrap(other)
-
-    def __truediv__(self, other):
-        return self.__array__() / _unwrap(other)
-
-    def __floordiv__(self, other):
-        return self.__array__() // _unwrap(other)
-
-    def __pow__(self, other):
-        return self.__array__() ** _unwrap(other)
-
-    def __neg__(self):
-        return -self.__array__()
-
-    def __pos__(self):
-        return +self.__array__()
-
-    def __abs__(self):
-        return abs(self.__array__())
-
-    # Right-hand operations to handle cases like `scalar - ParticleSetViewArray`
-    def __radd__(self, other):
-        return _unwrap(other) + self.__array__()
-
-    def __rsub__(self, other):
-        return _unwrap(other) - self.__array__()
-
-    def __rmul__(self, other):
-        return _unwrap(other) * self.__array__()
-
-    def __rtruediv__(self, other):
-        return _unwrap(other) / self.__array__()
-
-    def __rfloordiv__(self, other):
-        return _unwrap(other) // self.__array__()
-
-    def __rpow__(self, other):
-        return _unwrap(other) ** self.__array__()
-
-    # Comparison operators should return plain numpy boolean arrays so that
-    # expressions like `mask = particles.gridID == gid` produce an ndarray
-    # usable for indexing (rather than another ParticleSetViewArray).
-    def __eq__(self, other):
-        left = self.__array__()
-        right = _asarray(other)
-        return left == right
-
-    def __ne__(self, other):
-        left = self.__array__()
-        right = _asarray(other)
-        return left != right
-
-    def __lt__(self, other):
-        left = self.__array__()
-        right = _asarray(other)
-        return left < right
-
-    def __le__(self, other):
-        left = self.__array__()
-        right = _asarray(other)
-        return left <= right
-
-    def __gt__(self, other):
-        left = self.__array__()
-        right = _asarray(other)
-        return left > right
-
-    def __ge__(self, other):
-        left = self.__array__()
-        right = _asarray(other)
-        return left >= right
-
-    # Allow attribute access like .dtype etc. by forwarding to the ndarray
-    def __getattr__(self, item):
-        arr = self.__array__()
-        return getattr(arr, item)
+    A view as `owner` passes the write on to its own parent. Nothing is written once `owner` no
+    longer holds `source` (a view that wrote back and let go of its arrays, or a ParticleSet whose
+    arrays were replaced when particles were added or removed): the selection no longer applies.
+    """
+    if isinstance(owner, ParticleSetView):
+        if owner._arrays.get(name) is not source:
+            return
+        _put_rows(source, index, values)
+        owner._write_back_variable(name)
+    elif owner.get(name) is source:
+        _put_rows(source, index, values)

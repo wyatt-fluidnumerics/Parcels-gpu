@@ -2,9 +2,8 @@
 
 import math
 
-import numpy as np
-
 from parcels._core.statuscodes import StatusCode
+from parcels._core.utils.array_backend import array_namespace
 from parcels.kernels._integration import RK2, RK4
 
 __all__ = [
@@ -29,38 +28,38 @@ def rhs_uvw(fieldset, t, z, y, x, particles):
 def AdvectionRK2(particles, fieldset):  # pragma: no cover
     """Advection of particles using second-order Runge-Kutta integration."""
     u, v = RK2(particles, fieldset, rhs_uv)
-    particles.dx += u * particles.dt
-    particles.dy += v * particles.dt
+    particles.dx = particles.dx + u * particles.dt
+    particles.dy = particles.dy + v * particles.dt
 
 
 def AdvectionRK2_3D(particles, fieldset):  # pragma: no cover
     """Advection of particles using second-order Runge-Kutta integration including vertical velocity."""
     u, v, w = RK2(particles, fieldset, rhs_uvw)
-    particles.dx += u * particles.dt
-    particles.dy += v * particles.dt
-    particles.dz += w * particles.dt
+    particles.dx = particles.dx + u * particles.dt
+    particles.dy = particles.dy + v * particles.dt
+    particles.dz = particles.dz + w * particles.dt
 
 
 def AdvectionRK4(particles, fieldset):  # pragma: no cover
     """Advection of particles using fourth-order Runge-Kutta integration."""
     u, v = RK4(particles, fieldset, rhs_uv)
-    particles.dx += u * particles.dt
-    particles.dy += v * particles.dt
+    particles.dx = particles.dx + u * particles.dt
+    particles.dy = particles.dy + v * particles.dt
 
 
 def AdvectionRK4_3D(particles, fieldset):  # pragma: no cover
     """Advection of particles using fourth-order Runge-Kutta integration including vertical velocity."""
     u, v, w = RK4(particles, fieldset, rhs_uvw)
-    particles.dx += u * particles.dt
-    particles.dy += v * particles.dt
-    particles.dz += w * particles.dt
+    particles.dx = particles.dx + u * particles.dt
+    particles.dy = particles.dy + v * particles.dt
+    particles.dz = particles.dz + w * particles.dt
 
 
 def AdvectionEE(particles, fieldset):  # pragma: no cover
     """Advection of particles using Explicit Euler (aka Euler Forward) integration."""
     (u1, v1) = fieldset.UV[particles]
-    particles.dx += u1 * particles.dt
-    particles.dy += v1 * particles.dt
+    particles.dx = particles.dx + u1 * particles.dt
+    particles.dy = particles.dy + v1 * particles.dt
 
 
 def AdvectionRK45(particles, fieldset):  # pragma: no cover
@@ -72,7 +71,8 @@ def AdvectionRK45(particles, fieldset):  # pragma: no cover
     Time-step dt is halved if error is larger than fieldset.RK45_tol,
     and doubled if error is smaller than 1/10th of tolerance.
     """
-    sign_dt = np.sign(particles.dt)
+    xp = array_namespace(particles.dt)
+    sign_dt = xp.sign(particles.dt)
 
     c = [1.0 / 4.0, 3.0 / 8.0, 12.0 / 13.0, 1.0, 1.0 / 2.0]
     A = [
@@ -107,33 +107,33 @@ def AdvectionRK45(particles, fieldset):  # pragma: no cover
     x_5th = (u1 * b5[0] + u2 * b5[1] + u3 * b5[2] + u4 * b5[3] + u5 * b5[4] + u6 * b5[5]) * particles.dt
     y_5th = (v1 * b5[0] + v2 * b5[1] + v3 * b5[2] + v4 * b5[3] + v5 * b5[4] + v6 * b5[5]) * particles.dt
 
-    kappa = np.sqrt(np.pow(x_5th - x_4th, 2) + np.pow(y_5th - y_4th, 2))
+    kappa = xp.sqrt(xp.pow(x_5th - x_4th, 2) + xp.pow(y_5th - y_4th, 2))
 
-    good_particles = (kappa <= fieldset.RK45_tol) | (np.fabs(particles.dt) <= np.fabs(fieldset.RK45_min_dt))
-    particles.dx += np.where(good_particles, x_5th, 0)
-    particles.dy += np.where(good_particles, y_5th, 0)
+    good_particles = (kappa <= fieldset.RK45_tol) | (xp.abs(particles.dt) <= abs(fieldset.RK45_min_dt))
+    particles.dx = particles.dx + xp.where(good_particles, x_5th, 0)
+    particles.dy = particles.dy + xp.where(good_particles, y_5th, 0)
 
     increase_dt_particles = (
         good_particles
         & (kappa <= fieldset.RK45_tol / 10)
-        & (np.fabs(particles.dt * 2) <= np.fabs(fieldset.RK45_max_dt))
+        & (xp.abs(particles.dt * 2) <= abs(fieldset.RK45_max_dt))
     )
-    particles.next_dt = np.where(increase_dt_particles, particles.dt * 2, particles.dt)
-    particles.next_dt = np.where(
-        np.abs(particles.next_dt) > np.abs(fieldset.RK45_max_dt),
+    particles.next_dt = xp.where(increase_dt_particles, particles.dt * 2, particles.dt)
+    particles.next_dt = xp.where(
+        xp.abs(particles.next_dt) > abs(fieldset.RK45_max_dt),
         fieldset.RK45_max_dt * sign_dt,
         particles.next_dt,
     )
-    particles.state = np.where(good_particles, StatusCode.Success, particles.state)
+    particles.state = xp.where(good_particles, StatusCode.Success, particles.state)
 
-    repeat_particles = np.invert(good_particles)
-    particles.dt = np.where(repeat_particles, particles.dt / 2, particles.dt)
-    particles.dt = np.where(
-        np.abs(particles.dt) < np.abs(fieldset.RK45_min_dt),
+    repeat_particles = xp.logical_not(good_particles)
+    particles.dt = xp.where(repeat_particles, particles.dt / 2, particles.dt)
+    particles.dt = xp.where(
+        xp.abs(particles.dt) < abs(fieldset.RK45_min_dt),
         fieldset.RK45_min_dt * sign_dt,
         particles.dt,
     )
-    particles.state = np.where(repeat_particles, StatusCode.Repeat, particles.state)
+    particles.state = xp.where(repeat_particles, StatusCode.Repeat, particles.state)
 
 
 def AdvectionAnalytical(particles, fieldset):  # pragma: no cover
