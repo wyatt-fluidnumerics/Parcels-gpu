@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-import functools
+from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from parcels._core.statuscodes import _raise_outside_time_interval_error
-from parcels._core.utils.array_backend import array_namespace
+from parcels._core.utils.array_backend import (
+    array_namespace,
+    asarray_like,
+    atleast_1d,
+    copy_of,
+    deg2rad,
+    device_of,
+    is_array,
+)
 from parcels._core.utils.time import timedelta_to_float
 
 if TYPE_CHECKING:
@@ -18,6 +26,34 @@ if TYPE_CHECKING:
 GRID_SEARCH_ERROR = -3
 LEFT_OUT_OF_BOUNDS = -2
 RIGHT_OUT_OF_BOUNDS = -1
+
+
+def _cached_like(copies: list[tuple[ModuleType, Any, Any]], like: Any, convert: Callable[[Any], Any]) -> Any:
+    """The entry of ``copies`` for the array library and device of ``like``, made with ``convert(like)`` on first use.
+
+    Host-side constants that meet particle arrays are converted once per library and device. Entries are found by
+    comparing devices because the device objects of some libraries (CuPy) are not hashable.
+    """
+    xp = array_namespace(like)
+    device = _device_of(like)
+    for copy_xp, copy_device, values in copies:
+        if copy_xp is xp and copy_device == device:
+            return values
+    values = convert(like)
+    copies.append((xp, device, values))
+    return values
+
+
+def _device_of(values: Any) -> Any:
+    """Device of the array ``values``; ``None`` for Python scalars and sequences, which NumPy takes as they are."""
+    return device_of(values) if is_array(values) else None
+
+
+def _length(values: Any) -> int:
+    """``len(values)``, also for arrays of libraries without ``__len__`` (array-api-strict)."""
+    if is_array(values) and values.ndim > 0:
+        return values.shape[0]
+    return len(values)
 
 
 def _search_1d_array(
@@ -46,13 +82,17 @@ def _search_1d_array(
     """
     xp = array_namespace(x)
     # TODO v4: We probably rework this to deal with 0D arrays before this point (as we already know field dimensionality)
-    if len(arr) < 2:
-        return xp.zeros(shape=x.shape, dtype=np.int32), np.zeros_like(x)
-    arr = xp.asarray(arr)
-    index = np.clip(np.searchsorted(arr, x, side="left") - 1, 0, len(arr) - 2)
+    if _length(arr) < 2:
+        return xp.zeros(x.shape, dtype=xp.int32, device=device_of(x)), xp.zeros_like(x)
+    arr = asarray_like(arr, like=x)
+    if is_array(x) and xp.isdtype(x.dtype, "real floating") and xp.isdtype(arr.dtype, "integral"):
+        # Integer coordinates are cast explicitly to the floating-point type NumPy promotes them to with x
+        exact_float = xp.float32 if xp.iinfo(arr.dtype).bits <= 16 else xp.float64
+        arr = xp.astype(arr, xp.result_type(x.dtype, exact_float))
+    index = xp.clip(xp.searchsorted(arr, x, side="left") - 1, 0, arr.shape[0] - 2)
     # Use broadcasting to avoid repeated array access
     arr_index = arr[index]
-    arr_next = arr[np.clip(index + 1, 1, len(arr) - 1)]  # Ensure we don't go out of bounds
+    arr_next = arr[xp.clip(index + 1, 1, arr.shape[0] - 1)]  # Ensure we don't go out of bounds
     bcoord = (x - arr_index) / (arr_next - arr_index)
 
     # TODO check how we can avoid searchsorted when grid spacing is uniform
@@ -61,10 +101,10 @@ def _search_1d_array(
     # index = np.clip(index, 0, len(arr) - 2)
     # bcoord = (x - arr[index]) / dx
 
-    index = np.where(x < arr[0], LEFT_OUT_OF_BOUNDS, index)
-    index = np.where(x > arr[-1], RIGHT_OUT_OF_BOUNDS, index)
+    index = xp.where(x < arr[0], LEFT_OUT_OF_BOUNDS, index)
+    index = xp.where(x > arr[-1], RIGHT_OUT_OF_BOUNDS, index)
 
-    return np.atleast_1d(index), np.atleast_1d(bcoord)
+    return atleast_1d(index), atleast_1d(bcoord)
 
 
 def _search_1d_columns(columns: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -119,11 +159,12 @@ def _search_time_index(field: Field, time: np.ndarray):
     if the sampled value is outside the time value range.
     """
     if field.time_interval is None:
-        xp = array_namespace(time)
+        time_1d = atleast_1d(time)
+        xp = array_namespace(time_1d)
         return {
             "T": {
-                "index": xp.zeros(shape=np.atleast_1d(time).shape, dtype=np.int32),
-                "bcoord": xp.zeros(shape=np.atleast_1d(time).shape, dtype=np.float32),
+                "index": xp.zeros(time_1d.shape, dtype=xp.int32, device=device_of(time_1d)),
+                "bcoord": xp.zeros(time_1d.shape, dtype=xp.float32, device=device_of(time_1d)),
             }
         }
 
@@ -133,7 +174,7 @@ def _search_time_index(field: Field, time: np.ndarray):
     time_flt = timedelta_to_float(field.data.time.data - field.time_interval.left)
     ti, tau = _search_1d_array(time_flt, time)
 
-    return {"T": {"index": np.atleast_1d(ti), "bcoord": np.atleast_1d(tau)}}
+    return {"T": {"index": atleast_1d(ti), "bcoord": atleast_1d(tau)}}
 
 
 def curvilinear_point_in_cell(grid, y: np.ndarray, x: np.ndarray, yi: np.ndarray, xi: np.ndarray):
@@ -147,17 +188,21 @@ def curvilinear_point_in_cell(grid, y: np.ndarray, x: np.ndarray, yi: np.ndarray
     """
     xp = array_namespace(x)
     lon, lat = grid._node_coordinate_values(like=x)
-    clon = xp.stack([lon[yi, xi], lon[yi, xi + 1], lon[yi + 1, xi + 1], lon[yi + 1, xi]]).astype(float, copy=False)
-    clat = xp.stack([lat[yi, xi], lat[yi, xi + 1], lat[yi + 1, xi + 1], lat[yi + 1, xi]]).astype(float, copy=False)
+    clon = xp.astype(
+        xp.stack([lon[yi, xi], lon[yi, xi + 1], lon[yi + 1, xi + 1], lon[yi + 1, xi]]), xp.float64, copy=False
+    )
+    clat = xp.astype(
+        xp.stack([lat[yi, xi], lat[yi, xi + 1], lat[yi + 1, xi + 1], lat[yi + 1, xi]]), xp.float64, copy=False
+    )
 
     if grid.mesh.is_spherical():
         xsi, eta = _bilinear_inverse_tangent_plane(clon, clat, x, y)
-        is_in_cell = np.where((xsi >= 0) & (xsi <= 1) & (eta >= 0) & (eta <= 1), 1, 0)
+        is_in_cell = xp.astype((xsi >= 0) & (xsi <= 1) & (eta >= 0) & (eta <= 1), xp.int64)
     else:
         xsi, eta = _bilinear_inverse_latlon(clon, clat, x, y, apply_antimeridian_shift=False)
-        is_in_cell = np.where((xsi >= 0) & (xsi <= 1) & (eta >= 0) & (eta <= 1), 1, 0)
+        is_in_cell = xp.astype((xsi >= 0) & (xsi <= 1) & (eta >= 0) & (eta <= 1), xp.int64)
 
-    return is_in_cell, np.column_stack((xsi, eta))
+    return is_in_cell, xp.stack((xsi, eta), axis=1)
 
 
 _invA = np.array(
@@ -168,32 +213,39 @@ _invA = np.array(
         [1, -1, 1, -1],
     ]
 )
+_invA_copies: list[tuple[ModuleType, Any, Any]] = []
 
 
-@functools.cache
-def _invA_in(xp: ModuleType) -> Any:
-    """``_invA`` as an array of the module ``xp``, copied to the GPU only once."""
-    return xp.asarray(_invA)
+def _invA_in(like: Any) -> Any:
+    """``_invA`` as a float64 array in the array library and on the device of ``like``, converted only once."""
+    return _cached_like(_invA_copies, like, lambda like: asarray_like(_invA, like=like, dtype="float64"))
 
 
 def _bilinear_inverse(px, py, xq, yq):
     """Solve for (xsi, eta) s.t. bilinear blend of (px, py) corners equals (xq, yq)."""
     xp = array_namespace(px, xq)
-    eta_init = -1.0 * xp.ones(len(xq), dtype=float)
-    invA = _invA_in(xp)
-    a, b = np.dot(invA, px), np.dot(invA, py)
-    aa = a[3] * b[2] - a[2] * b[3]
-    bb = a[3] * b[0] - a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + xq * b[3] - yq * a[3]
-    cc = a[1] * b[0] - a[0] * b[1] + xq * b[1] - yq * a[1]
+    eta_init = -1.0 * xp.ones(_length(xq), dtype=xp.float64, device=device_of(xq))
+    invA = _invA_in(px)
+    a, b = xp.matmul(invA, px), xp.matmul(invA, py)
+    aa = a[3, ...] * b[2, ...] - a[2, ...] * b[3, ...]
+    bb = (
+        a[3, ...] * b[0, ...]
+        - a[0, ...] * b[3, ...]
+        + a[1, ...] * b[2, ...]
+        - a[2, ...] * b[1, ...]
+        + xq * b[3, ...]
+        - yq * a[3, ...]
+    )
+    cc = a[1, ...] * b[0, ...] - a[0, ...] * b[1, ...] + xq * b[1, ...] - yq * a[1, ...]
     det2 = bb * bb - 4 * aa * cc
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        det = np.where(det2 > 0, np.sqrt(det2), eta_init)
-        eta = np.where(abs(aa) < 1e-12, -cc / bb, np.where(det2 > 0, (-bb + det) / (2 * aa), eta_init))
-        xsi = np.where(
-            abs(a[1] + a[3] * eta) < 1e-12,
-            ((yq - py[0]) / (py[1] - py[0]) + (yq - py[3]) / (py[2] - py[3])) * 0.5,
-            (xq - a[0] - a[2] * eta) / (a[1] + a[3] * eta),
+        det = xp.where(det2 > 0, xp.sqrt(det2), eta_init)
+        eta = xp.where(abs(aa) < 1e-12, -cc / bb, xp.where(det2 > 0, (-bb + det) / (2 * aa), eta_init))
+        xsi = xp.where(
+            abs(a[1, ...] + a[3, ...] * eta) < 1e-12,
+            ((yq - py[0, ...]) / (py[1, ...] - py[0, ...]) + (yq - py[3, ...]) / (py[2, ...] - py[3, ...])) * 0.5,
+            (xq - a[0, ...] - a[2, ...] * eta) / (a[1, ...] + a[3, ...] * eta),
         )
     return xsi, eta
 
@@ -201,20 +253,20 @@ def _bilinear_inverse(px, py, xq, yq):
 def _bilinear_inverse_latlon(clon, clat, x, y, apply_antimeridian_shift=True):
     """Bilinear inverse in raw lat/lon, with antimeridian corner shifting."""
     xp = array_namespace(x)
-    px = clon.copy()
-    xq = xp.asarray(x, dtype=float).copy()
+    px = copy_of(clon)
+    xq = xp.asarray(x, dtype=xp.float64, copy=True)
     if apply_antimeridian_shift:
         px = ((px + 180.0) % 360.0) - 180.0
         xq = ((xq + 180.0) % 360.0) - 180.0
-        lon_span = px.max(axis=0) - px.min(axis=0)
+        lon_span = xp.max(px, axis=0) - xp.min(px, axis=0)
         antimeridian_cell = lon_span > 180.0
-        if np.any(antimeridian_cell):
+        if xp.any(antimeridian_cell):
             mask = (px < 0.0) & antimeridian_cell[np.newaxis, :] & (xq[np.newaxis, :] > 0.0)
             px[mask] += 360.0
             mask = (px > 0.0) & antimeridian_cell[np.newaxis, :] & (xq[np.newaxis, :] < 0.0)
             px[mask] -= 360.0
     py = clat
-    yq = xp.asarray(y, dtype=float)
+    yq = xp.asarray(y, dtype=xp.float64)
     return _bilinear_inverse(px, py, xq, yq)
 
 
@@ -257,39 +309,41 @@ def _spherical_project_cell_and_query(clon, clat, x, y):
     one-to-one; points behind it project to NaN and fail the bilinear gate.
     """
     xp = array_namespace(x)
-    cX, cY, cZ = _latlon_rad_to_xyz(np.deg2rad(clat), np.deg2rad(clon))  # (4, N) each
-    qX, qY, qZ = _latlon_rad_to_xyz(np.deg2rad(xp.asarray(y, dtype=float)), np.deg2rad(xp.asarray(x, dtype=float)))
+    cX, cY, cZ = _latlon_rad_to_xyz(deg2rad(clat), deg2rad(clon))  # (4, N) each
+    qX, qY, qZ = _latlon_rad_to_xyz(
+        deg2rad(xp.asarray(y, dtype=xp.float64)), deg2rad(xp.asarray(x, dtype=xp.float64))
+    )
 
     # Cell-intrinsic tangent basis from edge-midpoint difference vectors.
     # Corner order is CCW: c0=(yi,xi), c1=(yi,xi+1), c2=(yi+1,xi+1), c3=(yi+1,xi).
     # u-axis (along xsi): right-edge midpoint - left-edge midpoint = (c1+c2) - (c0+c3)
     # v-axis (along eta): top-edge   midpoint - bottom-edge midpoint = (c2+c3) - (c0+c1)
-    ux = (cX[1] + cX[2]) - (cX[0] + cX[3])
-    uy = (cY[1] + cY[2]) - (cY[0] + cY[3])
-    uz = (cZ[1] + cZ[2]) - (cZ[0] + cZ[3])
-    u_norm = np.sqrt(ux * ux + uy * uy + uz * uz)
-    u_norm = np.where(u_norm == 0.0, 1.0, u_norm)
+    ux = (cX[1, ...] + cX[2, ...]) - (cX[0, ...] + cX[3, ...])
+    uy = (cY[1, ...] + cY[2, ...]) - (cY[0, ...] + cY[3, ...])
+    uz = (cZ[1, ...] + cZ[2, ...]) - (cZ[0, ...] + cZ[3, ...])
+    u_norm = xp.sqrt(ux * ux + uy * uy + uz * uz)
+    u_norm = xp.where(u_norm == 0.0, 1.0, u_norm)
     e_ux, e_uy, e_uz = ux / u_norm, uy / u_norm, uz / u_norm
 
-    vx = (cX[2] + cX[3]) - (cX[0] + cX[1])
-    vy = (cY[2] + cY[3]) - (cY[0] + cY[1])
-    vz = (cZ[2] + cZ[3]) - (cZ[0] + cZ[1])
+    vx = (cX[2, ...] + cX[3, ...]) - (cX[0, ...] + cX[1, ...])
+    vy = (cY[2, ...] + cY[3, ...]) - (cY[0, ...] + cY[1, ...])
+    vz = (cZ[2, ...] + cZ[3, ...]) - (cZ[0, ...] + cZ[1, ...])
     # Gram-Schmidt: make e_v perpendicular to e_u so the bilinear inverse
     # in (u, v) is well-conditioned even on skewed cells.
     v_dot_eu = vx * e_ux + vy * e_uy + vz * e_uz
     vx = vx - v_dot_eu * e_ux
     vy = vy - v_dot_eu * e_uy
     vz = vz - v_dot_eu * e_uz
-    v_norm = np.sqrt(vx * vx + vy * vy + vz * vz)
-    v_norm = np.where(v_norm == 0.0, 1.0, v_norm)
+    v_norm = xp.sqrt(vx * vx + vy * vy + vz * vz)
+    v_norm = xp.where(v_norm == 0.0, 1.0, v_norm)
     e_vx, e_vy, e_vz = vx / v_norm, vy / v_norm, vz / v_norm
 
     # Unit normal of the plane, which is tangent to the sphere at the cell's centre.
-    nx = cX.sum(axis=0)
-    ny = cY.sum(axis=0)
-    nz = cZ.sum(axis=0)
-    n_norm = np.sqrt(nx * nx + ny * ny + nz * nz)
-    n_norm = np.where(n_norm == 0.0, 1.0, n_norm)
+    nx = xp.sum(cX, axis=0)
+    ny = xp.sum(cY, axis=0)
+    nz = xp.sum(cZ, axis=0)
+    n_norm = xp.sqrt(nx * nx + ny * ny + nz * nz)
+    n_norm = xp.where(n_norm == 0.0, 1.0, n_norm)
     e_nx, e_ny, e_nz = nx / n_norm, ny / n_norm, nz / n_norm
 
     # Gnomonic projection: scale each direction until it meets the plane, then read off
@@ -298,7 +352,7 @@ def _spherical_project_cell_and_query(clon, clat, x, y):
         # A direction pointing away from the plane never meets it. Setting those to NaN
         # keeps the division quiet and leaves them to fail the caller's bilinear gate.
         along_normal = vx * e_nx + vy * e_ny + vz * e_nz
-        scale = 1.0 / np.where(along_normal > 0.0, along_normal, np.nan)
+        scale = 1.0 / xp.where(along_normal > 0.0, along_normal, xp.nan)
         u = scale * (vx * e_ux + vy * e_uy + vz * e_uz)
         v = scale * (vx * e_vx + vy * e_vy + vz * e_vz)
         return u, v
@@ -336,28 +390,28 @@ def _search_indices_curvilinear_2d(
         - xsi (np.ndarray): Array of barycentric coordinates in the i-direction within the found grid cells.
     """
     xp = array_namespace(x)
-    if np.any(xi):
+    if xi is not None and xp.any(xi):
         # If an initial guess is provided, we first perform a point in cell check for all guessed indices
         is_in_cell, coords = curvilinear_point_in_cell(grid, y, x, yi, xi)
-        y_check = y[is_in_cell == 0]
-        x_check = x[is_in_cell == 0]
-        zero_indices = np.where(is_in_cell == 0)[0]
+        not_found = is_in_cell == 0
+        y_check = y[not_found]
+        x_check = x[not_found]
     else:
         # Otherwise, we need to check all points
-        yi = xp.full(len(y), GRID_SEARCH_ERROR, dtype=np.int32)
-        xi = xp.full(len(x), GRID_SEARCH_ERROR, dtype=np.int32)
+        yi = xp.full(_length(y), GRID_SEARCH_ERROR, dtype=xp.int32, device=_device_of(y))
+        xi = xp.full(_length(x), GRID_SEARCH_ERROR, dtype=xp.int32, device=_device_of(x))
         y_check = y
         x_check = x
-        coords = -1.0 * xp.ones((len(y), 2), dtype=np.float32)
-        zero_indices = xp.arange(len(y))
+        coords = -1.0 * xp.ones((_length(y), 2), dtype=xp.float32, device=_device_of(y))
+        not_found = xp.ones(_length(y), dtype=xp.bool, device=_device_of(y))
 
     # If there are any points that were not found in the first step, we query the spatial hash for those points
-    if len(zero_indices) > 0:
+    if xp.any(not_found):
         yi_q, xi_q, coords_q = grid.get_spatial_hash().query(y_check, x_check)
         # Only those points that were not found in the first step are updated
-        coords[zero_indices, :] = coords_q
-        yi[zero_indices] = yi_q
-        xi[zero_indices] = xi_q
+        coords[not_found] = xp.astype(coords_q, coords.dtype, copy=False)
+        yi[not_found] = xp.astype(yi_q, yi.dtype, copy=False)
+        xi[not_found] = xp.astype(xi_q, xi.dtype, copy=False)
 
     xsi = coords[:, 0]
     eta = coords[:, 1]
@@ -520,8 +574,9 @@ def _latlon_rad_to_xyz(
     """Converts Spherical latitude and longitude coordinates into Cartesian x,
     y, z coordinates.
     """
-    x = np.cos(lon) * np.cos(lat)
-    y = np.sin(lon) * np.cos(lat)
-    z = np.sin(lat)
+    xp = array_namespace(lat, lon)
+    x = xp.cos(lon) * xp.cos(lat)
+    y = xp.sin(lon) * xp.cos(lat)
+    z = xp.sin(lat)
 
     return x, y, z

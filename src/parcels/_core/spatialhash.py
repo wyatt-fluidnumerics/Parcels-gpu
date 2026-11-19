@@ -6,11 +6,20 @@ import numpy as np
 
 from parcels._core.index_search import (
     GRID_SEARCH_ERROR,
+    _cached_like,
     _latlon_rad_to_xyz,
     curvilinear_point_in_cell,
     uxgrid_point_in_cell,
 )
-from parcels._core.utils.array_backend import array_namespace, is_gpu_array
+from parcels._core.utils.array_backend import (
+    array_namespace,
+    asarray_like,
+    deg2rad,
+    device_of,
+    flatnonzero,
+    is_array,
+    unravel_index,
+)
 from parcels._core.warnings import FieldSetWarning
 from parcels._python import isinstance_noimport
 from parcels._repr_utils import spatialhash_describe
@@ -221,7 +230,7 @@ class SpatialHash:
 
         # Generate the mapping from the hash indices to unstructured grid elements
         self._hash_table = self._initialize_hash_table()
-        self._gpu_hash_table: dict[str, Any] | None = None
+        self._hash_table_copies: list[tuple[Any, Any, dict[str, Any]]] = []
 
     def _total_hash_entries(self, bitwidth):
         """Total number of (face, hash cell) pairs the hash table would hold at a given
@@ -363,8 +372,9 @@ class SpatialHash:
         # The codes are already sorted at this point, first by morton code, then by face_id
         # Starting indices of the matrix rows are located by finding indices where the morton codes differ
         starts = np.concatenate(([0], np.flatnonzero(morton_codes_sorted[1:] != morton_codes_sorted[:-1]) + 1))
-        # The unique keys for the hash table are the unique morton codes
-        keys = morton_codes_sorted[starts]
+        # The unique keys for the hash table are the unique morton codes. They are kept as int32, which holds
+        # the 30-bit codes exactly and which every array library can search (PyTorch cannot search uint32)
+        keys = morton_codes_sorted[starts].astype(np.int32)
         # The number of faces per hash keys (morton codes) is easily calculated as the difference betwee the start values
         counts = np.diff(np.concatenate((starts, [morton_codes_sorted.size])))
 
@@ -380,16 +390,16 @@ class SpatialHash:
         return hash_table
 
     def _hash_table_like(self, like) -> dict[str, Any]:
-        """The hash table arrays, as arrays of the same kind (NumPy or CuPy) as ``like``.
+        """The hash table arrays in the array library and on the device of ``like``.
 
-        The table is built on the host; its GPU copy is made on the first GPU query and reused.
+        The table is built on the host and converted on the first query from each library and device;
+        NumPy gets the host arrays themselves.
         """
-        if not is_gpu_array(like):
-            return self._hash_table
-        if self._gpu_hash_table is None:
-            xp = array_namespace(like)
-            self._gpu_hash_table = {name: xp.asarray(values) for name, values in self._hash_table.items()}
-        return self._gpu_hash_table
+        return _cached_like(
+            self._hash_table_copies,
+            like,
+            lambda like: {name: asarray_like(values, like=like) for name, values in self._hash_table.items()},
+        )
 
     def query(self, y, x):
         """
@@ -423,51 +433,57 @@ class SpatialHash:
 
         if self._source_grid.mesh.is_spherical():
             # Convert coords to Cartesian coordinates (x, y, z)
-            lat = np.deg2rad(y)
-            lon = np.deg2rad(x)
+            lat = deg2rad(y)
+            lon = deg2rad(x)
             qx, qy, qz = _latlon_rad_to_xyz(lat, lon)
         else:
             # For Cartesian grids, use the coordinates directly
             qx = x
             qy = y
-            qz = np.zeros_like(qx)
+            qz = xp.zeros_like(qx)
 
-        query_codes = _encode_morton3d(
-            qx,
-            qy,
-            qz,
-            self._xmin,
-            self._xmax,
-            self._ymin,
-            self._ymax,
-            self._zmin,
-            self._zmax,
-            bitwidth=self._bitwidth,
-        ).ravel()
-        num_queries = query_codes.size
+        query_codes = xp.reshape(
+            _encode_morton3d(
+                qx,
+                qy,
+                qz,
+                self._xmin,
+                self._xmax,
+                self._ymin,
+                self._ymax,
+                self._zmin,
+                self._zmax,
+                bitwidth=self._bitwidth,
+            ),
+            (-1,),
+        )
+        # Compared in the dtype of the keys (int32), which holds the 30-bit codes exactly
+        query_codes = xp.astype(query_codes, keys.dtype)
+        num_queries = query_codes.shape[0]
+        device = device_of(query_codes)
 
         # Locate each query in the unique key array
-        pos = np.searchsorted(keys, query_codes)  # pos is shape (num_queries,)
+        pos = xp.searchsorted(keys, query_codes)  # pos is shape (num_queries,)
 
         # Valid hits: inside range with finite query coordinates and query codes give exact morton code match.
-        valid = (pos < len(keys)) & np.isfinite(x) & np.isfinite(y)
+        valid = (pos < keys.shape[0]) & xp.isfinite(x) & xp.isfinite(y)
         # Clip pos to valid range to avoid out-of-bounds indexing
-        pos = np.clip(pos, 0, len(keys) - 1)
+        pos = xp.clip(pos, 0, keys.shape[0] - 1)
         # Further filter out false positives from searchsorted by checking for exact code match
-        valid[valid] &= query_codes[valid] == keys[pos[valid]]
+        valid &= query_codes == keys[pos]
 
         # Pre-allocate i and j indices of the best match for each query
         # Default values to -1 (no match case)
-        j_best = xp.full(num_queries, GRID_SEARCH_ERROR, dtype=np.int32)
-        i_best = xp.full(num_queries, GRID_SEARCH_ERROR, dtype=np.int32)
+        j_best = xp.full(num_queries, GRID_SEARCH_ERROR, dtype=xp.int32, device=device)
+        i_best = xp.full(num_queries, GRID_SEARCH_ERROR, dtype=xp.int32, device=device)
 
         # How many matches each query has; hit_counts[i] is the number of hits for query i
-        hit_counts = np.where(valid, counts[pos], 0).astype(np.int32)  # has shape (num_queries,)
-        if hit_counts.sum() == 0:
+        hit_counts = xp.astype(xp.where(valid, counts[pos], 0), xp.int32)  # has shape (num_queries,)
+        if xp.sum(hit_counts) == 0:
             return (
-                j_best.reshape(query_codes.shape),
-                i_best.reshape(query_codes.shape),
-                xp.full((num_queries, self._coord_dim), -1.0, dtype=np.float32),
+                xp.reshape(j_best, query_codes.shape),
+                xp.reshape(i_best, query_codes.shape),
+                xp.full((num_queries, self._coord_dim), -1.0, dtype=xp.float32, device=device),
             )
 
         # Now, for each query, we need to gather the candidate (j,i) indices from the hash table
@@ -477,8 +493,8 @@ class SpatialHash:
         has_hits = hit_counts > 0  # shape (num_queries,), True for queries that had candidates
 
         # A quick lookup array that maps all candindates back to its query index
-        q_index_for_candidate = np.repeat(
-            xp.arange(num_queries, dtype=np.int32), hit_counts
+        q_index_for_candidate = xp.repeat(
+            xp.arange(num_queries, dtype=xp.int32, device=device), hit_counts
         )  # shape (hit_counts.sum(),)
         # Map all candidates to positions in the hash table
         hash_positions = pos[q_index_for_candidate]  # shape (hit_counts.sum(),)
@@ -489,8 +505,8 @@ class SpatialHash:
         # hit_counts gives the number of candidates for each query
 
         # We need to build an array that gives the offset within each query's candidates
-        offsets = np.concatenate((xp.zeros(1, dtype=np.int32), np.cumsum(hit_counts))).astype(
-            np.int32
+        offsets = xp.astype(
+            xp.concat((xp.zeros(1, dtype=xp.int32, device=device), xp.cumulative_sum(hit_counts))), xp.int32
         )  # shape (num_queries+1,)
         total = int(offsets[-1])  # total number of candidates across all queries
 
@@ -498,49 +514,56 @@ class SpatialHash:
         # This way, we can easily take the starts[pos[q_index_for_candidate]] and add this local id to get the absolute index
         # We calculate this by computing the "global candidate number" (0..total-1) and subtracting the offsets of the corresponding query
         # This gives us an array that goes from 0..hit_counts[i]-1 for each query i
-        intra = xp.arange(total, dtype=np.int32) - np.repeat(offsets[:-1], hit_counts)  # shape (hit_counts.sum(),)
+        intra = xp.arange(total, dtype=xp.int32, device=device) - xp.repeat(
+            offsets[:-1], hit_counts
+        )  # shape (hit_counts.sum(),)
 
         # starts[pos[q_index_for_candidate]] + intra gives a list of positions in the hash table that we can
         # use to quickly gather the (i,j) pairs for each query
-        source_idx = starts[hash_positions].astype(np.int32) + intra
+        source_idx = xp.astype(starts[hash_positions], xp.int32) + intra
 
         # Gather all candidate face ids in one shot and unravel them to (j, i) pairs;
         # only the gathered candidates are unraveled, not the whole table
         face_all = faces[source_idx]
-        j_all, i_all = np.unravel_index(face_all, self._xlow.shape)
+        j_all, i_all = unravel_index(xp.astype(face_all, xp.int64), self._xlow.shape)
 
         # Now we need to construct arrays that repeats the y and x coordinates for each candidate
         # to enable vectorized point-in-cell checks
-        y_rep = np.repeat(y, hit_counts)  # shape (hit_counts.sum(),)
-        x_rep = np.repeat(x, hit_counts)  # shape (hit_counts.sum(),)
+        y_rep = xp.repeat(y, hit_counts)  # shape (hit_counts.sum(),)
+        x_rep = xp.repeat(x, hit_counts)  # shape (hit_counts.sum(),)
 
         # For each query we perform a point in cell check.
         is_in_face, coordinates = self._point_in_cell(self._source_grid, y_rep, x_rep, j_all, i_all)
 
-        coords_best = xp.full((num_queries, coordinates.shape[1]), -1.0, dtype=np.float32)
+        coords_best = xp.full((num_queries, coordinates.shape[1]), -1.0, dtype=xp.float32, device=device)
 
         # For each query that has hits, we need to find the first candidate that was inside the face
-        f_indices = np.flatnonzero(is_in_face)  # Indices of all faces that contained the point
+        f_indices = flatnonzero(is_in_face)  # Indices of all faces that contained the point
         # For each true position, find which query it belongs to by searching offsets
         # Query index q satisfies offsets[q] <= pos < offsets[q+1].
-        q = np.searchsorted(offsets[1:], f_indices, side="right")
+        q = xp.searchsorted(offsets[1:], f_indices, side="right")
 
-        uniq_q, q_idx = np.unique(q, return_index=True)
+        # q is non-decreasing, so the first occurrence of each query is where q changes
+        is_first = xp.ones(q.shape[0], dtype=xp.bool, device=device)
+        is_first[1:] = q[1:] != q[:-1]
+        uniq_q = q[is_first]
+        q_idx = flatnonzero(is_first)
         keep = has_hits[uniq_q]
 
-        if keep.any():
+        if xp.any(keep):
             uniq_q = uniq_q[keep]
             pos_first = f_indices[q_idx[keep]]
 
-            # Directly scatter: the code wants the first True inside each slice
-            j_best[uniq_q] = j_all[pos_first]
-            i_best[uniq_q] = i_all[pos_first]
-            coords_best[uniq_q] = coordinates[pos_first]
+            # Scatter through a mask over the queries: the code wants the first True inside each slice
+            is_located = xp.isin(xp.arange(num_queries, dtype=uniq_q.dtype, device=device), uniq_q)
+            j_best[is_located] = xp.astype(j_all[pos_first], j_best.dtype)
+            i_best[is_located] = xp.astype(i_all[pos_first], i_best.dtype)
+            coords_best[is_located] = xp.astype(xp.take(coordinates, pos_first, axis=0), coords_best.dtype)
 
         return (
-            j_best.reshape(query_codes.shape),
-            i_best.reshape(query_codes.shape),
-            coords_best.reshape((num_queries, coordinates.shape[1])),
+            xp.reshape(j_best, query_codes.shape),
+            xp.reshape(i_best, query_codes.shape),
+            xp.reshape(coords_best, (num_queries, coordinates.shape[1])),
         )
 
     def describe(self, buf: IO | None = None) -> None:
@@ -573,34 +596,40 @@ def _dilate_bits(n):
     Example:
         Input n:  b9 b8 b7 b6 b5 b4 b3 b2 b1 b0
         Output:   b9 0 0 b8 0 0 b7 0 0 ... b0 0 0
+
+    The bits are shifted in uint32, or in int64 when ``n`` is int64 (PyTorch has no shifts for unsigned
+    integers). Every mask drops whatever a uint32 shift would push out, so both give the same values.
     """
-    n = array_namespace(n).asarray(n, dtype=np.uint32)
+    xp = array_namespace(n)
+    n = xp.asarray(n)
+    if n.dtype != xp.int64:
+        n = xp.astype(n, xp.uint32, copy=False)
 
     # Step 1: Keep only the lowest 10 bits of n
     # Mask = 0x3FF = binary 11 1111 1111
-    n &= np.uint32(0x000003FF)
+    n &= 0x000003FF
 
     # Step 2: First spreading stage
     # Shift left by 16 and OR with original.
     # This spreads the bits apart, but introduces overlaps.
     # Mask 0xff0000ff clears out the unwanted overlaps.
-    n = (n | (n << np.uint32(16))) & np.uint32(0xFF0000FF)
+    n = (n | (n << 16)) & 0xFF0000FF
 
     # Step 3: Second spreading stage
     # Similar idea: shift left by 8, OR, then mask.
     # Now the bits are further separated.
-    n = (n | (n << np.uint32(8))) & np.uint32(0x0300F00F)
+    n = (n | (n << 8)) & 0x0300F00F
 
     # Step 4: Third spreading stage
     # Shift by 4, OR, mask again.
     # At this point, there are 1 or 2 zeros between many of the bits.
-    n = (n | (n << np.uint32(4))) & np.uint32(0x030C30C3)
+    n = (n | (n << 4)) & 0x030C30C3
 
     # Step 5: Final spreading stage
     # Shift by 2, OR, mask.
     # After this, each original bit is isolated with exactly two zeros
     # between it and the next bit, ready for 3D Morton interleaving.
-    n = (n | (n << np.uint32(2))) & np.uint32(0x09249249)
+    n = (n | (n << 2)) & 0x09249249
 
     # Return the dilated value.
     return n
@@ -807,11 +836,16 @@ def quantize_coordinates(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth=1
     dz = zmax - zmin
 
     # Normalize to [0,1]; if a range is degenerate, map to 0 to avoid NaN/inf.
-    # np.not_equal returns a NumPy bool even for Python float bounds; CuPy's where rejects a Python bool condition.
     with np.errstate(invalid="ignore"):
-        xn = np.where(np.not_equal(dx, 0), (x - xmin) / dx, 0.0)
-        yn = np.where(np.not_equal(dy, 0), (y - ymin) / dy, 0.0)
-        zn = np.where(np.not_equal(dz, 0), (z - zmin) / dz, 0.0)
+        xn = (x - _bound_like(xmin, x)) / _bound_like(dx, x)
+        yn = (y - _bound_like(ymin, y)) / _bound_like(dy, y)
+        zn = (z - _bound_like(zmin, z)) / _bound_like(dz, z)
+    if dx == 0:
+        xn = xp.zeros_like(xn)
+    if dy == 0:
+        yn = xp.zeros_like(yn)
+    if dz == 0:
+        zn = xp.zeros_like(zn)
 
     # --- 2) Quantize to (0..bitwidth). ---
     # Multiply by bitwidth, round down, and clip to be safe against overshoot.
@@ -820,11 +854,24 @@ def quantize_coordinates(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth=1
     # NaN queries produce arbitrary codes here; they are discarded downstream by the
     # finite-coordinate mask in SpatialHash.query.
     with np.errstate(invalid="ignore"):
-        xq = np.clip(xn * bitwidth, 0, bitwidth).astype(np.uint32)
-        yq = np.clip(yn * bitwidth, 0, bitwidth).astype(np.uint32)
-        zq = np.clip(zn * bitwidth, 0, bitwidth).astype(np.uint32)
+        xq = xp.astype(xp.clip(xn * bitwidth, 0, bitwidth), xp.uint32)
+        yq = xp.astype(xp.clip(yn * bitwidth, 0, bitwidth), xp.uint32)
+        zq = xp.astype(xp.clip(zn * bitwidth, 0, bitwidth), xp.uint32)
 
     return xq, yq, zq
+
+
+def _bound_like(bound, like):
+    """A hash grid bound, or the width of its range, ready to meet the array ``like``.
+
+    NumPy scalars become arrays of ``like``'s library with one entry along each of its axes, which promote as the
+    scalars do in NumPy in every library (PyTorch does not promote with zero-dimensional tensors). Python scalars
+    are returned as they are, so that they keep their weak promotion.
+    """
+    if not is_array(bound):
+        return bound
+    xp = array_namespace(like)
+    return xp.reshape(asarray_like(bound, like=like), (1,) * like.ndim)
 
 
 def _encode_quantized_morton3d(xq, yq, zq):
@@ -834,9 +881,11 @@ def _encode_quantized_morton3d(xq, yq, zq):
 
     # --- 3) Bit-dilate each 10-bit number so each bit is separated by two zeros. ---
     # _dilate_bits maps:  b9..b0  ->  b9 0 0 b8 0 0 ... b0 0 0
-    dx3 = _dilate_bits(xq).astype(np.uint32)
-    dy3 = _dilate_bits(yq).astype(np.uint32)
-    dz3 = _dilate_bits(zq).astype(np.uint32)
+    # Cast to uint32 first: _dilate_bits keeps int64 input in int64, and the cell coordinates of a table
+    # with more than 2**31 entries are int64
+    dx3 = _dilate_bits(xq.astype(np.uint32, copy=False)).astype(np.uint32)
+    dy3 = _dilate_bits(yq.astype(np.uint32, copy=False)).astype(np.uint32)
+    dz3 = _dilate_bits(zq.astype(np.uint32, copy=False)).astype(np.uint32)
 
     # --- 4) Interleave the dilated bits into a single Morton code. ---
     # Bit layout (from LSB upward): x0,y0,z0, x1,y1,z1, ..., x9,y9,z9
@@ -884,9 +933,10 @@ def _encode_morton3d(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth=1023)
 
     # --- 3) Bit-dilate each 10-bit number so each bit is separated by two zeros. ---
     # _dilate_bits maps:  b9..b0  ->  b9 0 0 b8 0 0 ... b0 0 0
-    dx3 = _dilate_bits(xq).astype(np.uint32)
-    dy3 = _dilate_bits(yq).astype(np.uint32)
-    dz3 = _dilate_bits(zq).astype(np.uint32)
+    # Particle positions are dilated and interleaved in int64: PyTorch has no shifts for unsigned integers.
+    dx3 = _dilate_bits(xp.astype(xq, xp.int64))
+    dy3 = _dilate_bits(xp.astype(yq, xp.int64))
+    dz3 = _dilate_bits(xp.astype(zq, xp.int64))
 
     # --- 4) Interleave the dilated bits into a single Morton code. ---
     # Bit layout (from LSB upward): x0,y0,z0, x1,y1,z1, ..., x9,y9,z9
@@ -895,7 +945,7 @@ def _encode_morton3d(x, y, z, xmin, xmax, ymin, ymax, zmin, zmax, bitwidth=1023)
     code = (dz3 << 2) | (dy3 << 1) | dx3
 
     # Since our compact type fits in 30 bits, uint32 is enough.
-    return code.astype(np.uint32)
+    return xp.astype(code, xp.uint32)
 
 
 def _generate_valid_mask(xlow, xhigh, ylow, yhigh, zlow, zhigh):

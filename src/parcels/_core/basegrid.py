@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from parcels._core.index_search import _length
 from parcels._core.mesh import FlatMesh, SphericalMesh
 from parcels._core.spatialhash import SpatialHash
-from parcels._core.utils.array_backend import array_namespace
+from parcels._core.utils.array_backend import array_namespace, device_of
 
 if TYPE_CHECKING:
     import numpy as np
@@ -122,7 +123,7 @@ class BaseGrid(ABC):
         """
         dims = np.array([self.get_axis_dim(axis) for axis in self.axes], dtype=int)
         xp = array_namespace(*axis_indices.values())
-        indices = [xp.asarray(axis_indices[axis]).astype(int) for axis in self.axes]
+        indices = [xp.astype(xp.asarray(axis_indices[axis]), xp.int64) for axis in self.axes]
         return _ravel(dims, indices)
 
     def unravel_index(self, ei: int) -> dict[str, np.ndarray]:
@@ -157,7 +158,8 @@ class BaseGrid(ABC):
         """
         dims = np.array([self.get_axis_dim(axis) for axis in self.axes], dtype=int)
         indices = _unravel(dims, ei)
-        return dict(zip(self.axes, indices, strict=True))
+        rows = [indices[i, :] for i in range(indices.shape[0])]
+        return dict(zip(self.axes, rows, strict=True))
 
     @property
     @abstractmethod
@@ -249,11 +251,13 @@ def _unravel(dims, ei):
     """
     strides = np.cumprod(dims[::-1])[::-1]
 
-    indices = array_namespace(ei).empty((len(dims), len(ei)), dtype=int)
+    xp = array_namespace(ei)
+    ei = xp.asarray(ei)
+    indices = xp.empty((len(dims), _length(ei)), dtype=xp.int64, device=device_of(ei))
 
     for i in range(len(dims) - 1):
-        indices[i, :] = ei // strides[i + 1]
-        ei = ei % strides[i + 1]
+        indices[i, :] = ei // int(strides[i + 1])
+        ei = ei % int(strides[i + 1])
 
     indices[-1, :] = ei
     return indices
@@ -281,6 +285,6 @@ def _ravel(dims, indices):
     strides = np.cumprod(dims[::-1])[::-1]
     ei = 0
     for i in range(len(dims) - 1):
-        ei += indices[i] * strides[i + 1]
+        ei += indices[i] * int(strides[i + 1])
 
     return ei + indices[-1]
