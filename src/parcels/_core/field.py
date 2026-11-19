@@ -321,13 +321,14 @@ def _update_particles_ei(particles, grid_positions: dict, field: Field):
     """Update the element index (ei) of the particles"""
     if particles is not None:
         if isinstance(field.grid, XGrid):
-            particles.ei[:, field.igrid] = field.grid.ravel_index(
+            ei = field.grid.ravel_index(
                 {
                     "X": grid_positions["X"]["index"],
                     "Y": grid_positions["Y"]["index"],
                     "Z": grid_positions["Z"]["index"],
                 }
             )
+            particles.ei[:, field.igrid] = array_namespace(ei).astype(ei, particles.ei.dtype)
         elif isinstance(field.grid, UxGrid):
             particles.ei[:, field.igrid] = field.grid.ravel_index(
                 {

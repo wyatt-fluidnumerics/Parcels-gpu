@@ -8,6 +8,7 @@ import cftime
 import numpy as np
 import numpy.typing as npt
 
+from parcels._core.utils.array_backend import array_namespace, atleast_1d
 from parcels._repr_utils import timeinterval_repr
 
 if TYPE_CHECKING:
@@ -61,8 +62,9 @@ class TimeInterval:
         return self.left <= item <= self.right
 
     def is_all_time_in_interval(self, time: float | np.ndarray):
-        item = np.atleast_1d(time)
-        return (0 <= item).all() and (item <= self.time_length_as_flt).all()
+        item = atleast_1d(time)
+        xp = array_namespace(item)
+        return bool(xp.all(0 <= item)) and bool(xp.all(item <= float(self.time_length_as_flt)))
 
     def __repr__(self) -> str:
         return timeinterval_repr(self)
