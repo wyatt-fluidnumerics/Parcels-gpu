@@ -21,6 +21,7 @@ classifiers = [
   "Intended Audience :: Science/Research",
 ]
 dependencies = [
+  "array-api-compat >=1.11",
   "cf_xarray >=0.10.0",
   "cftime >=1.6.3",
   "dask >=2025.7.0",

@@ -16,6 +16,7 @@ from parcels._core._windowed_array import maybe_windowed
 from parcels._core.basegrid import BaseGrid
 from parcels._core.field import Field, VectorField
 from parcels._core.mesh import FlatMesh, SphericalMesh, _infer_mesh_from_coordinates
+from parcels._core.utils.array_backend import NUMPY_PLACEMENT, ArrayPlacement, is_array
 from parcels._core.utils.time import TimeInterval
 from parcels._core.uxgrid import UxGrid
 from parcels._core.xgrid import (
@@ -86,6 +87,28 @@ class ModelData(ABC):
         if windowed is not None and name in windowed:
             return windowed[name]
         return self.data[name]
+
+    @property
+    def array_placement(self) -> ArrayPlacement:
+        """The array library, and device, that this model's field data is returned in.
+
+        A Parcels backend reports its own. Field data held eagerly in an array library is returned in
+        that library. Lazily loaded data is computed to NumPy.
+        """
+        placements = set()
+        windowed = self.__dict__.get("_windowed", {})
+        for name in self.scalar_field_names:
+            if name in windowed:
+                placements.add(NUMPY_PLACEMENT)
+                continue
+            data = self.data.variables[name]._data
+            placement = getattr(data, "array_placement", None)
+            if placement is None and is_array(data) and not is_dask_collection(data):
+                placement = ArrayPlacement.of(data)
+            placements.add(NUMPY_PLACEMENT if placement is None else placement)
+        if len(placements) > 1:
+            raise ValueError(f"The fields of one model are held in more than one array library or device: {placements}")
+        return placements.pop() if placements else NUMPY_PLACEMENT
 
     @property
     def uses_gpu_arrays(self) -> bool:

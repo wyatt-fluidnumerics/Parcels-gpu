@@ -17,6 +17,7 @@ from parcels._core.model import (
     UnstructuredModelData,
     create_empty_constant_field_model,
 )
+from parcels._core.utils.array_backend import NUMPY_PLACEMENT, ArrayPlacement
 from parcels._core.utils.string import _assert_str_and_python_varname
 from parcels._core.utils.time import get_datetime_type_calendar
 from parcels._core.utils.time import is_compatible as datetime_is_compatible
@@ -248,6 +249,16 @@ class FieldSet:
     @property
     def uses_gpu_arrays(self) -> bool:
         return any(model.uses_gpu_arrays for model in self.models)
+
+    @property
+    def array_placement(self) -> ArrayPlacement:
+        """The array library, and device, that field data is returned in. Particle data is held there too."""
+        placements = {model.array_placement for model in self.models}
+        if len(placements) > 1:
+            raise ValueError(
+                f"The models of this FieldSet hold their fields in more than one array library or device: {placements}"
+            )
+        return placements.pop() if placements else NUMPY_PLACEMENT
 
     def add_constant_field(self, name: str, value):
         """Wrapper function to add a Field that is constant in space,

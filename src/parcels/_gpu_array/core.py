@@ -11,7 +11,7 @@ from dask.base import is_dask_collection
 from xarray.core.indexing import BasicIndexer, ExplicitlyIndexedNDArrayMixin, OuterIndexer, VectorizedIndexer
 
 from parcels._chunk_cached_array import ChunkCachedArray
-from parcels._core.utils.array_backend import import_cupy
+from parcels._core.utils.array_backend import ArrayPlacement, import_cupy
 from parcels._core.warnings import FieldSetWarning
 
 if TYPE_CHECKING:
@@ -146,6 +146,10 @@ class GpuArray(ExplicitlyIndexedNDArrayMixin):
             self._level_held_by_slot = np.arange(n_levels, dtype=np.int64)
             self.loads = n_levels
             self.bytes_read = n_levels * self._level_bytes
+
+    @property
+    def array_placement(self) -> ArrayPlacement:
+        return ArrayPlacement.of(self._buffer)
 
     def __repr__(self) -> str:
         return (
