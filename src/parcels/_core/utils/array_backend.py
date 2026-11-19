@@ -116,6 +116,10 @@ def asarray_like(values: Any, like: Any, *, dtype: str | None = None) -> Any:
     data type of ``values`` is kept.
     """
     xp = array_namespace(like)
+    if xp is not compat_numpy and is_numpy_array(values) and not values.flags.writeable:
+        # xarray hands out dimension coordinates read-only, and libraries that share memory with
+        # the NumPy array they are given must not be handed memory they could write through.
+        values = values.copy()
     if not is_array_api_obj(like):
         return xp.asarray(values, dtype=None if dtype is None else getattr(xp, dtype))
     return xp.asarray(values, dtype=None if dtype is None else getattr(xp, dtype), device=device_of(like))

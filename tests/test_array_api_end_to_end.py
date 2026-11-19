@@ -50,10 +50,6 @@ LIBRARIES = ["numpy", "array_api_strict", "torch"]
 NUMPY_NAMESPACE = namespace_of_library(np)
 MESHES = {"flat": FlatMesh(), "spherical": SphericalMesh()}
 
-# PyTorch warns, once per process, when it wraps a read-only NumPy array, which is what xarray returns for a
-# dimension coordinate such as "depth". Parcels never writes to these tensors.
-pytestmark = pytest.mark.filterwarnings("ignore:The given NumPy array is not writable:UserWarning")
-
 
 @pytest.fixture(params=LIBRARIES)
 def library(request: pytest.FixtureRequest) -> str:
