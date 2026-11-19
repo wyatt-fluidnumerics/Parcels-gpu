@@ -204,15 +204,3 @@ def unravel_index(flat_index: Any, dims: Sequence[int]) -> tuple[Any, ...]:
     indices.append(remainder)
     return tuple(reversed(indices))
 
-
-def is_gpu_array(array: Any) -> bool:
-    """Whether ``array`` is a CuPy array. Kept only until its last caller is converted."""
-    return array_api_compat.is_cupy_array(array)
-
-
-def import_cupy() -> ModuleType:
-    try:
-        import cupy
-    except ImportError as e:
-        raise ImportError("Running Parcels on a GPU requires CuPy, which is not installed in this environment.") from e
-    return cupy

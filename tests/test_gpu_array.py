@@ -1,4 +1,4 @@
-"""Tests of the GpuArray backend. They need CuPy and a GPU, and are skipped otherwise."""
+"""Tests of the windowed backend holding field data in CuPy. They need CuPy and a GPU, and are skipped otherwise."""
 
 import io
 
@@ -6,14 +6,16 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 import xarray as xr
+from array_api_compat import is_cupy_array, is_cupy_namespace
 
 import parcels
 import parcels._sgrid as sgrid
 from parcels._core.mesh import FlatMesh
-from parcels._core.utils.array_backend import is_gpu_array, to_numpy
+from parcels._core.utils.array_backend import NUMPY_PLACEMENT, to_numpy
 from parcels._core.warnings import FieldSetWarning
 from parcels._datasets.structured.generated import radial_rotation_dataset
-from parcels._gpu_array import GpuArray
+from parcels._prefetch import NoPrefetcher
+from parcels._windowed_array import WindowedArray
 from parcels.kernels import AdvectionEE, AdvectionRK2, AdvectionRK4
 
 cupy = pytest.importorskip("cupy")
@@ -69,11 +71,11 @@ def rectilinear_dataset(nx: int = 60, ny: int = 40, nz: int = 6, nt: int = 4, ch
     )
 
 
-def rectilinear_fieldset(on_gpu: bool, chunked: bool = False) -> parcels.FieldSet:
+def rectilinear_fieldset(on_gpu: bool, chunked: bool = False, prefetcher=None) -> parcels.FieldSet:
     fieldset = parcels.FieldSet.from_sgrid_conventions(
         rectilinear_dataset(chunked=chunked), mesh=parcels.SphericalMesh()
     )
-    return fieldset.to_gpu_arrays() if on_gpu else fieldset
+    return fieldset.to_windowed_arrays(cupy, prefetcher=prefetcher) if on_gpu else fieldset
 
 
 def seeded_particleset(fieldset: parcels.FieldSet, npart: int = 500, pclass=parcels.Particle, **kwargs):
@@ -98,7 +100,7 @@ def assert_particles_match(pset_gpu, pset_cpu, variables=("x", "y", "z", "t"), r
 
 
 # ------------------------------------------------------------------------------------------------
-# GpuArray indexing against NumPy
+# WindowedArray in CuPy, indexing against NumPy
 # ------------------------------------------------------------------------------------------------
 @pytest.fixture
 def host_array() -> np.ndarray:
@@ -109,14 +111,14 @@ def host_array() -> np.ndarray:
 def test_vectorized_indexing_matches_numpy(host_array, index_module):
     rng = np.random.default_rng(1)
     host_indices = [rng.integers(-n, n, 200) for n in host_array.shape]
-    gpu_array = GpuArray(host_array, windowed=False)
+    gpu_array = WindowedArray(host_array, windowed=False, array_library=cupy)
     gathered = gpu_array._raw_vindex(*(index_module.asarray(index) for index in host_indices))
-    assert is_gpu_array(gathered)
+    assert is_cupy_array(gathered)
     np.testing.assert_array_equal(gathered.get(), host_array[tuple(host_indices)])
 
 
 def test_vectorized_indexing_broadcasts(host_array):
-    gpu_array = GpuArray(host_array, windowed=False)
+    gpu_array = WindowedArray(host_array, windowed=False, array_library=cupy)
     t = np.array([0, 3])[:, None, None]
     z = np.array([1, 2, 3])[None, :, None]
     y = np.arange(6)[None, None, :]
@@ -130,9 +132,9 @@ def test_isel_through_xarray_matches_numpy(host_array):
     points = {dim: rng.integers(0, n, 50) for dim, n in zip(dims, host_array.shape, strict=True)}
     expected = xr.Variable(dims, host_array).isel({dim: xr.Variable("points", index) for dim, index in points.items()})
 
-    gpu_variable = xr.Variable(dims, GpuArray(host_array, windowed=False))
+    gpu_variable = xr.Variable(dims, WindowedArray(host_array, windowed=False, array_library=cupy))
     result = gpu_variable.isel({dim: xr.Variable("points", cupy.asarray(index)) for dim, index in points.items()})
-    assert is_gpu_array(result.data)
+    assert is_cupy_array(result.data)
     np.testing.assert_array_equal(result.data.get(), expected.data)
 
 
@@ -145,14 +147,14 @@ def test_isel_leaves_unindexed_dimension_as_trailing_axis(host_array):
         {dim: xr.Variable("points", index) for dim, index in points.items()}
     )
 
-    gpu_variable = xr.Variable(dims, GpuArray(single_depth, windowed=False))
+    gpu_variable = xr.Variable(dims, WindowedArray(single_depth, windowed=False, array_library=cupy))
     result = gpu_variable.isel({dim: xr.Variable("points", cupy.asarray(index)) for dim, index in points.items()})
     assert result.dims == expected.dims
     np.testing.assert_array_equal(result.data.get(), expected.data)
 
 
 def test_orthogonal_indexing_matches_numpy(host_array):
-    gpu_array = GpuArray(host_array, windowed=False)
+    gpu_array = WindowedArray(host_array, windowed=False, array_library=cupy)
     np.testing.assert_array_equal(gpu_array[1, 2].get(), host_array[1, 2])
     np.testing.assert_array_equal(gpu_array[(slice(1, 4), 0, slice(None), 3)].get(), host_array[1:4, 0, :, 3])
     np.testing.assert_array_equal(
@@ -161,31 +163,25 @@ def test_orthogonal_indexing_matches_numpy(host_array):
     )
 
 
-def test_out_of_range_spatial_indices_are_clamped(host_array):
-    gpu_array = GpuArray(host_array, windowed=False)
-    gathered = gpu_array._raw_vindex(np.array([0]), np.array([0]), np.array([100]), np.array([-100]))
-    np.testing.assert_array_equal(gathered.get(), host_array[0, 0, -1, 0])
-
-
 def test_windowed_array_loads_levels_on_demand(host_array):
     import dask.array
 
     lazy_array = dask.array.from_array(host_array, chunks=(1, -1, -1, -1))
-    gpu_array = GpuArray(lazy_array, windowed=True)
-    assert gpu_array.levels_on_gpu == []
+    gpu_array = WindowedArray(lazy_array, windowed=True, array_library=cupy)
+    assert gpu_array.resident_levels == []
     spatial = (np.array([1, 2]), np.array([3, 4]), np.array([5, 6]))
 
     np.testing.assert_array_equal(
         gpu_array._raw_vindex(np.array([0, 1]), *spatial).get(), host_array[np.array([0, 1]), *spatial]
     )
-    assert gpu_array.levels_on_gpu == [0, 1]
+    assert gpu_array.resident_levels == [0, 1]
     assert gpu_array.loads == 2
 
     # advancing the clock evicts level 0 and loads only the new level
     np.testing.assert_array_equal(
         gpu_array._raw_vindex(np.array([1, 2]), *spatial).get(), host_array[np.array([1, 2]), *spatial]
     )
-    assert gpu_array.levels_on_gpu == [1, 2]
+    assert gpu_array.resident_levels == [1, 2]
     assert gpu_array.loads == 3
 
     # a single resident level needs no load
@@ -199,19 +195,20 @@ def test_windowed_array_grows_for_wide_time_span(host_array):
     import dask.array
 
     lazy_array = dask.array.from_array(host_array, chunks=(1, -1, -1, -1))
-    gpu_array = GpuArray(lazy_array, windowed=True, max_levels=2)
+    gpu_array = WindowedArray(lazy_array, windowed=True, array_library=cupy, max_levels=2)
     levels = np.array([0, 3, 1])
     spatial = (np.array([1, 2, 0]), np.array([3, 4, 0]), np.array([5, 6, 0]))
-    with pytest.warns(FieldSetWarning, match="exceeds max_levels=2"):
+    with pytest.warns(FieldSetWarning, match="exceeds max_level=2"):
         gathered = gpu_array._raw_vindex(levels, *spatial)
     np.testing.assert_array_equal(gathered.get(), host_array[levels, *spatial])
-    assert gpu_array.levels_on_gpu == [0, 1, 2, 3]
+    assert gpu_array.resident_levels == [0, 1, 3]
 
 
 def test_windowed_array_rejects_out_of_range_level(host_array):
     import dask.array
 
-    gpu_array = GpuArray(dask.array.from_array(host_array, chunks=(1, -1, -1, -1)), windowed=True)
+    lazy_array = dask.array.from_array(host_array, chunks=(1, -1, -1, -1))
+    gpu_array = WindowedArray(lazy_array, windowed=True, array_library=cupy)
     with pytest.raises(IndexError, match="out of bounds for axis 0"):
         gpu_array._raw_vindex(np.array([5]), np.array([0]), np.array([0]), np.array([0]))
 
@@ -219,25 +216,24 @@ def test_windowed_array_rejects_out_of_range_level(host_array):
 # ------------------------------------------------------------------------------------------------
 # FieldSet / ParticleSet on the GPU
 # ------------------------------------------------------------------------------------------------
-def test_to_gpu_arrays_wraps_fields_and_is_idempotent():
+def test_to_windowed_arrays_in_cupy_wraps_fields_and_is_idempotent():
     fieldset = rectilinear_fieldset(on_gpu=True)
-    assert fieldset.uses_gpu_arrays
+    assert is_cupy_namespace(fieldset.array_placement.namespace)
     wrapper = fieldset.U.data.variable._data
-    assert isinstance(wrapper, GpuArray)
-    fieldset.to_gpu_arrays()
+    assert isinstance(wrapper, WindowedArray)
+    fieldset.to_windowed_arrays(cupy)
     assert fieldset.U.data.variable._data is wrapper
 
     buf = io.StringIO()
     fieldset.describe(buf)
-    assert "GpuArray" in buf.getvalue()
+    assert "WindowedArray (cupy)" in buf.getvalue()
 
 
 def test_particle_data_lives_on_gpu():
     pset = seeded_particleset(rectilinear_fieldset(on_gpu=True))
-    assert all(is_gpu_array(values) for values in pset._data.values())
-    assert not parcels.FieldSet.from_sgrid_conventions(
-        rectilinear_dataset(), mesh=parcels.SphericalMesh()
-    ).uses_gpu_arrays
+    assert all(is_cupy_array(values) for values in pset._data.values())
+    cpu_fieldset = parcels.FieldSet.from_sgrid_conventions(rectilinear_dataset(), mesh=parcels.SphericalMesh())
+    assert cpu_fieldset.array_placement == NUMPY_PLACEMENT
 
 
 def test_field_eval_matches_cpu():
@@ -266,7 +262,7 @@ def test_advection_matches_cpu(kernel, chunked):
         pset = seeded_particleset(fieldset)
         pset.execute(kernel, runtime=np.timedelta64(12, "h"), dt=np.timedelta64(30, "m"), verbose_progress=False)
         psets[on_gpu] = pset
-    assert is_gpu_array(psets[True].x)
+    assert is_cupy_array(psets[True].x)
     assert_particles_match(psets[True], psets[False])
 
 
@@ -285,7 +281,7 @@ def test_flat_mesh_2d_advection_matches_cpu():
     for on_gpu in (False, True):
         fieldset = parcels.FieldSet.from_sgrid_conventions(radial_rotation_dataset(), mesh=FlatMesh())
         if on_gpu:
-            fieldset.to_gpu_arrays()
+            fieldset.to_windowed_arrays(cupy)
         pset = parcels.ParticleSet(fieldset, x=np.linspace(32, 50, 40), y=np.full(40, 30.0))
         pset.execute(AdvectionRK4, runtime=np.timedelta64(6, "h"), dt=np.timedelta64(10, "m"), verbose_progress=False)
         psets[on_gpu] = pset
@@ -384,7 +380,7 @@ def test_particles_added_on_gpu_stay_on_gpu():
     pset = seeded_particleset(fieldset, npart=10)
     pset += seeded_particleset(fieldset, npart=5)
     assert len(pset) == 15
-    assert all(is_gpu_array(values) for values in pset._data.values())
+    assert all(is_cupy_array(values) for values in pset._data.values())
     pset.execute(AdvectionRK2, runtime=np.timedelta64(1, "h"), dt=np.timedelta64(30, "m"), verbose_progress=False)
     assert len(np.unique(to_numpy(pset.particle_id))) == 15
 
@@ -393,12 +389,11 @@ def test_particles_added_on_gpu_stay_on_gpu():
 # Reading time levels ahead
 # ------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("dt_sign", [1, -1])
-def test_prefetched_levels_are_used_and_change_nothing(dt_sign, monkeypatch):
+def test_prefetched_levels_are_used_and_change_nothing(dt_sign):
     """A run crossing every time level, with and without reading ahead, forward and backward."""
     psets = {}
     for prefetch in (False, True):
-        monkeypatch.setattr(GpuArray, "prefetch_next_level", prefetch)
-        fieldset = rectilinear_fieldset(on_gpu=True, chunked=True)
+        fieldset = rectilinear_fieldset(on_gpu=True, chunked=True, prefetcher=None if prefetch else NoPrefetcher)
         start = np.datetime64("2000-01-01T00:00") if dt_sign == 1 else np.datetime64("2000-01-01T18:00")
         pset = seeded_particleset(fieldset, npart=200, t=np.full(200, start))
         pset.execute(

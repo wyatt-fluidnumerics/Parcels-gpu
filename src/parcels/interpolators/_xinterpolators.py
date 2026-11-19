@@ -11,7 +11,6 @@ from dask import is_dask_collection
 import parcels._core.utils.interpolation as i_u
 import parcels._sgrid as sgrid
 import parcels._typing as ptyping
-from parcels._core._windowed_array import WindowedArray
 from parcels._core.utils.array_backend import array_namespace, asarray_like, deg2rad, device_of, is_array, isclose
 from parcels.interpolators._base import ScalarInterpolator, VectorInterpolator
 
@@ -25,7 +24,7 @@ _CORNER_DIMS: dict[ptyping.XgcmAxisDirection, str] = {axis: f"corner_{axis}" for
 
 
 def _gather_corners(
-    data: xr.DataArray | WindowedArray,
+    data: xr.DataArray,
     axis_dim: dict[ptyping.XgridAxis, str],
     levels: dict[ptyping.XgcmAxisDirection, tuple[np.ndarray, ...]],
     npart: int,
@@ -43,7 +42,7 @@ def _gather_corners(
 
     Parameters
     ----------
-    data : xr.DataArray or WindowedArray
+    data : xr.DataArray
         Field data, with dimensions ordered ``(time, Z, Y, X)``.
     axis_dim : dict
         Maps ``"X"``, ``"Y"`` and ``"Z"`` to dimension names. The ``"T"``
@@ -69,7 +68,7 @@ def _gather_corners(
     counts = tuple(len(levels[axis]) for axis in _CORNER_AXES)
     shape = (*counts, npart)
 
-    storage = None if isinstance(data, WindowedArray) else data.variable._data
+    storage = data.variable._data
     if hasattr(storage, "_raw_vindex") or (is_array(storage) and not is_dask_collection(storage)):
         # One index array per stored dimension. Each indexed axis puts its levels in its own slot
         # of the corner grid, so the indexing broadcasts the corner grid itself. Dimensions that no
@@ -113,9 +112,8 @@ def _gather_corners(
             indexed_corner_dims.append(_CORNER_DIMS[axis])
 
     # Indexing the variable keeps xarray from also indexing every dimension coordinate with the
-    # point arrays. A WindowedArray is not a variable-level array, it intercepts ``isel`` itself.
-    indexable = data if isinstance(data, WindowedArray) else data.variable
-    gathered = indexable.isel(selection_dict).transpose(*indexed_corner_dims, "points", ...).data
+    # point arrays.
+    gathered = data.variable.isel(selection_dict).transpose(*indexed_corner_dims, "points", ...).data
 
     # Dimensions the field has but no axis indexes (size-1 mock dimensions) trail the points dimension.
     gathered = gathered.reshape(gathered.shape[: len(indexed_corner_dims) + 1])
@@ -129,7 +127,7 @@ def _gather_corners(
 
 
 def _get_corner_data_Agrid(
-    data: xr.DataArray | WindowedArray,
+    data: xr.DataArray,
     ti: np.ndarray,
     zi: np.ndarray,
     yi: np.ndarray,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Sequence
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Self
 
 import cf_xarray  # noqa: F401
@@ -12,7 +13,7 @@ from dask import is_dask_collection
 import parcels._sgrid as sgrid
 import parcels._typing as ptyping
 from parcels._chunk_cached_array import wrap_dataset
-from parcels._core._windowed_array import maybe_windowed
+from parcels._chunk_cached_array.core import _placement_of_library
 from parcels._core.basegrid import BaseGrid
 from parcels._core.field import Field, VectorField
 from parcels._core.mesh import FlatMesh, SphericalMesh, _infer_mesh_from_coordinates
@@ -24,10 +25,9 @@ from parcels._core.xgrid import (
     _transpose_xfield_data_to_tzyx,
     assert_all_field_dims_have_axis,
 )
-from parcels._gpu_array import GpuArray
-from parcels._gpu_array import wrap_dataset as wrap_dataset_in_gpu_arrays
 from parcels._logger import logger
 from parcels._python import NOTSET, NotSetType
+from parcels._windowed_array import wrap_dataset as wrap_dataset_in_windowed_arrays
 from parcels.interpolators import (
     CGrid_Velocity,
     Ux_Velocity,
@@ -44,6 +44,8 @@ from parcels.interpolators._base import ScalarInterpolator, VectorInterpolator
 
 if TYPE_CHECKING:
     import uxarray as ux
+
+    from parcels._prefetch import PrefetcherFactory
 
 
 class ModelData(ABC):
@@ -77,15 +79,7 @@ class ModelData(ABC):
         return
 
     def field_data(self, name: str) -> Any:
-        """Return the array backing field ``name``.
-
-        Normally this is the ``xr.DataArray`` held in the dataset. After
-        :meth:`to_windowed_arrays`, dask-backed fields are served through a
-        cached :class:`~parcels._core._windowed_array.WindowedArray` instead.
-        """
-        windowed = self.__dict__.get("_windowed")
-        if windowed is not None and name in windowed:
-            return windowed[name]
+        """Return the ``xr.DataArray`` backing field ``name``."""
         return self.data[name]
 
     @property
@@ -96,11 +90,7 @@ class ModelData(ABC):
         that library. Lazily loaded data is computed to NumPy.
         """
         placements = set()
-        windowed = self.__dict__.get("_windowed", {})
         for name in self.scalar_field_names:
-            if name in windowed:
-                placements.add(NUMPY_PLACEMENT)
-                continue
             data = self.data.variables[name]._data
             placement = getattr(data, "array_placement", None)
             if placement is None and is_array(data) and not is_dask_collection(data):
@@ -110,58 +100,52 @@ class ModelData(ABC):
             raise ValueError(f"The fields of one model are held in more than one array library or device: {placements}")
         return placements.pop() if placements else NUMPY_PLACEMENT
 
-    @property
-    def uses_gpu_arrays(self) -> bool:
-        return any(isinstance(self.data.variables[name]._data, GpuArray) for name in self.scalar_field_names)
-
-    def to_gpu_arrays(self, *, max_levels: int | None = None) -> Self:
-        """Hold field data on the GPU.
-
-        Opt-in, and requires CuPy. Replaces each field variable's internal storage
-        with a :class:`~parcels._gpu_array.GpuArray`. Vectorized ``.isel()`` calls
-        then gather on the GPU and return CuPy arrays. NumPy-backed (eager) fields
-        are copied to the GPU in full. Dask-backed fields with a leading ``time``
-        dimension keep a rolling window of time levels on the GPU, each level
-        loaded once and evicted as the clock advances.
-
-        Coordinate variables are loaded eagerly into host memory. Only structured
-        (SGRID) models with a 1D vertical coordinate are supported.
-
-        Idempotent: re-invoking is safe — ``wrap_dataset`` skips variables whose
-        storage is already a ``GpuArray``.
-
-        Parameters
-        ----------
-        max_levels : int, optional
-            Number of time levels kept on the GPU per dask-backed field. Defaults
-            to two, the levels bracketing the current time when all particles
-            share a clock. A sample that spans more levels makes the window grow
-            to that span.
-        """
+    def _assert_supports_array_library(self, array_library: ModuleType | None, device: Any, backend: str) -> None:
+        if _placement_of_library(array_library, device) == NUMPY_PLACEMENT:
+            return
         if not isinstance(self.grid, XGrid):
-            raise NotImplementedError("GPU arrays are currently only supported for structured (SGRID) models.")
+            raise NotImplementedError(
+                f"{backend}s in an array library other than NumPy are only supported for structured (SGRID) models."
+            )
         if "depth" in self.data and self.data["depth"].ndim == 4:
-            raise NotImplementedError("GPU arrays do not support time-varying (4D) vertical coordinates yet.")
-        if self.__dict__.get("_windowed"):
-            raise ValueError("This model already uses windowed arrays; GPU arrays cannot be combined with them.")
-        self.data = wrap_dataset_in_gpu_arrays(self.data, self.scalar_field_names, max_levels=max_levels)
-        return self
+            raise NotImplementedError(
+                f"{backend}s in an array library other than NumPy do not support time-varying (4D) vertical coordinates yet."
+            )
 
-    def to_windowed_arrays(self, *, max_levels: int | None = None) -> Self:
-        """Wrap dask-backed field data in rolling time-window caches.
+    def to_windowed_arrays(
+        self,
+        array_library: ModuleType | None = None,
+        *,
+        device: Any = None,
+        max_levels: int | None = None,
+        prefetcher: PrefetcherFactory | None = None,
+    ) -> Self:
+        """Hold dask-backed field data in rolling time-window caches.
 
-        Opt-in optimization for forward-marching simulations where all particles
-        share a single clock. For each dask-backed, time-leading field, ``isel``
-        then samples a resident NumPy window (each time level loaded once and
-        evicted as the clock advances) instead of re-reading chunks and paying the
-        dask scheduling overhead on every kernel step. NumPy-backed (eager) fields
-        and non-time-leading fields are left unchanged.
+        Opt-in optimization for simulations where all particles share a single
+        clock. Replaces the internal storage of each dask-backed, time-leading
+        field with a :class:`~parcels._windowed_array.WindowedArray`: vectorized
+        ``.isel()`` calls then sample a resident window of time levels (each level
+        loaded once and evicted as the clock advances) instead of re-reading chunks
+        and paying the dask scheduling overhead on every kernel step. The levels
+        the clock reaches next are read ahead in the background.
+
+        With NumPy, eager fields and non-time-leading fields are left unchanged.
+        With another array library, they are converted to that library in full,
+        so that all field data is returned in the same library. Coordinate
+        variables are loaded eagerly into host memory.
 
         Idempotent: re-invoking reuses the existing wrapper (and its warm cache)
         rather than rebuilding it.
 
         Parameters
         ----------
+        array_library : module, optional
+            Array library to hold the field data in, e.g. ``numpy``, ``cupy``,
+            ``torch`` or ``array_api_strict``. Defaults to NumPy. Libraries other
+            than NumPy are supported for structured (SGRID) models only.
+        device : optional
+            Device within ``array_library``, passed to it untouched.
         max_levels : int, optional
             Hard cap on the number of time levels kept resident per field.
             With the default ``None``, each interpolation call decides what
@@ -172,18 +156,33 @@ class ModelData(ABC):
             Only when a single call requests a wider time span (e.g. particles
             spread across many time levels) does the window grow beyond that,
             and ``max_levels`` then bounds its size.
+        prefetcher : callable, optional
+            How levels are read ahead: a prefetcher class or factory, called with
+            the function that reads one time level. Defaults to
+            :class:`~parcels._prefetch.ThreadPrefetcher`. Pass
+            :class:`~parcels._prefetch.NoPrefetcher` to read levels only when
+            they are needed, or e.g.
+            ``functools.partial(DataLoaderPrefetcher, num_workers=2)`` to read
+            them with a PyTorch DataLoader.
         """
-        windowed = self.__dict__.setdefault("_windowed", {})
-        for dim in ["lon", "lat", "depth"]:
-            # ensure lon, lat, depth are loaded into memory for dask-backed datasets
-            if dim in self.data and is_dask_collection(self.data[dim]):
-                self.data[dim].load()
-        for name in self.scalar_field_names:
-            current = windowed.get(name, self.data[name])
-            windowed[name] = maybe_windowed(current, max_levels=max_levels)
+        self._assert_supports_array_library(array_library, device, "Windowed array")
+        self.data = wrap_dataset_in_windowed_arrays(
+            self.data,
+            self.scalar_field_names,
+            array_library=array_library,
+            device=device,
+            max_levels=max_levels,
+            prefetcher=prefetcher,
+        )
         return self
 
-    def to_chunk_cached_arrays(self, *, max_cache_bytes: int = 600_000_000) -> Self:
+    def to_chunk_cached_arrays(
+        self,
+        array_library: ModuleType | None = None,
+        *,
+        device: Any = None,
+        max_cache_bytes: int = 600_000_000,
+    ) -> Self:
         """Wrap dask-backed field data in chunk-level LRU caches.
 
         Opt-in optimization that replaces each dask-backed data variable's
@@ -200,10 +199,19 @@ class ModelData(ABC):
 
         Parameters
         ----------
+        array_library : module, optional
+            Array library that chunks are converted to, once each, after they are
+            read, e.g. ``numpy``, ``torch``, ``cupy`` or ``array_api_strict``.
+            Defaults to NumPy. With another library, fields that are not
+            dask-backed are wrapped as well, one chunk per time level. Libraries
+            other than NumPy are supported for structured (SGRID) models only.
+        device : optional
+            Device within ``array_library``, passed to it untouched.
         max_cache_bytes : int, optional
             Maximum cache size in bytes, per variable. Defaults to 600 MB.
         """
-        self.data = wrap_dataset(self.data, max_cache_bytes=max_cache_bytes)
+        self._assert_supports_array_library(array_library, device, "Chunk-cached array")
+        self.data = wrap_dataset(self.data, max_cache_bytes=max_cache_bytes, array_library=array_library, device=device)
         return self
 
     @property

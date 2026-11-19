@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Iterable
-from typing import IO, TYPE_CHECKING
+from types import ModuleType
+from typing import IO, TYPE_CHECKING, Any
 
 import cf_xarray  # noqa: F401
 import numpy as np
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     import uxarray as ux
 
     from parcels._core.basegrid import BaseGrid
+    from parcels._prefetch import PrefetcherFactory
     from parcels._typing import TimeLike
 __all__ = ["FieldSet"]
 
@@ -162,19 +164,37 @@ class FieldSet:
 
         return overlap
 
-    def to_windowed_arrays(self, *, max_levels: int | None = None):
-        """Wrap dask-backed field data in rolling time-window caches.
+    def to_windowed_arrays(
+        self,
+        array_library: ModuleType | None = None,
+        *,
+        device: Any = None,
+        max_levels: int | None = None,
+        prefetcher: PrefetcherFactory | None = None,
+    ):
+        """Hold dask-backed field data in rolling time-window caches.
 
-        Opt-in optimization for forward-marching simulations where all particles
-        share a single clock. Delegates to each underlying model; dask-backed,
-        time-leading fields are served through a resident NumPy window (each time
-        level loaded once and evicted as the clock advances) instead of re-reading
-        chunks on every kernel step. NumPy-backed (eager) and non-time-leading
-        fields are left unchanged, and re-invoking is idempotent, so this is safe
-        to call more than once.
+        Opt-in optimization for simulations where all particles share a single
+        clock. Replaces each field variable's internal storage with a
+        :class:`~parcels._windowed_array.WindowedArray`. Delegates to each
+        underlying model; dask-backed, time-leading fields are served through a
+        resident window of time levels in the array library (each time level
+        loaded once and evicted as the clock advances, the next levels read ahead
+        in the background) instead of re-reading chunks on every kernel step. With
+        NumPy, eager and non-time-leading fields are left unchanged; with another
+        library they are converted to it in full. A :class:`~parcels.ParticleSet`
+        created from this FieldSet afterwards holds its particle data in the same
+        library. Re-invoking is idempotent, so this is safe to call more than once.
 
         Parameters
         ----------
+        array_library : module, optional
+            Array library to hold the field data in, e.g. ``numpy``, ``cupy``
+            (to run on a GPU), ``torch`` or ``array_api_strict``. Defaults to
+            NumPy. Libraries other than NumPy are supported for structured (SGRID)
+            models only.
+        device : optional
+            Device within ``array_library``, passed to it untouched.
         max_levels : int, optional
             Hard cap on the number of time levels kept resident per field.
             With the default ``None``, each interpolation call decides what
@@ -185,6 +205,14 @@ class FieldSet:
             Only when a single call requests a wider time span (e.g. particles
             spread across many time levels) does the window grow beyond that,
             and ``max_levels`` then bounds its size.
+        prefetcher : callable, optional
+            How time levels are read ahead: a prefetcher class or factory, called
+            with the function that reads one time level. Defaults to
+            :class:`~parcels._prefetch.ThreadPrefetcher`. Pass
+            :class:`~parcels._prefetch.NoPrefetcher` to read levels only when
+            they are needed, or e.g.
+            ``functools.partial(DataLoaderPrefetcher, num_workers=2)`` to read
+            them with a PyTorch DataLoader.
 
         Returns
         -------
@@ -192,10 +220,16 @@ class FieldSet:
             ``self``, to allow chaining.
         """
         for model in self.models:
-            model.to_windowed_arrays(max_levels=max_levels)
+            model.to_windowed_arrays(array_library, device=device, max_levels=max_levels, prefetcher=prefetcher)
         return self
 
-    def to_chunk_cached_arrays(self, *, max_cache_bytes: int = 600_000_000):
+    def to_chunk_cached_arrays(
+        self,
+        array_library: ModuleType | None = None,
+        *,
+        device: Any = None,
+        max_cache_bytes: int = 600_000_000,
+    ):
         """Wrap dask-backed field data in chunk-level LRU caches.
 
         Opt-in optimization that replaces each dask-backed data variable's
@@ -207,6 +241,16 @@ class FieldSet:
 
         Parameters
         ----------
+        array_library : module, optional
+            Array library that chunks are converted to, once each, after they are
+            read, e.g. ``numpy``, ``torch``, ``cupy`` or ``array_api_strict``.
+            Defaults to NumPy. With another library, fields that are not
+            dask-backed are wrapped as well, one chunk per time level, and a
+            :class:`~parcels.ParticleSet` created from this FieldSet afterwards
+            holds its particle data in that library. Libraries other than NumPy
+            are supported for structured (SGRID) models only.
+        device : optional
+            Device within ``array_library``, passed to it untouched.
         max_cache_bytes : int, optional
             Maximum cache size in bytes, per variable. Defaults to 600 MB.
 
@@ -216,39 +260,8 @@ class FieldSet:
             ``self``, to allow chaining.
         """
         for model in self.models:
-            model.to_chunk_cached_arrays(max_cache_bytes=max_cache_bytes)
+            model.to_chunk_cached_arrays(array_library, device=device, max_cache_bytes=max_cache_bytes)
         return self
-
-    def to_gpu_arrays(self, *, max_levels: int | None = None):
-        """Hold field data on the GPU as CuPy arrays, so that particles are advected on the GPU.
-
-        Opt-in, and requires CuPy. Replaces each field variable's internal storage
-        with a :class:`~parcels._gpu_array.GpuArray`. Delegates to each underlying
-        model: NumPy-backed (eager) fields are copied to the GPU in full, dask-backed
-        fields with a leading ``time`` dimension keep a rolling window of time levels
-        on the GPU. A :class:`~parcels.ParticleSet` created from this FieldSet
-        afterwards holds its particle data on the GPU as well. Only structured (SGRID)
-        models are supported.
-
-        Parameters
-        ----------
-        max_levels : int, optional
-            Number of time levels kept on the GPU per dask-backed field. Defaults to
-            two, the levels bracketing the current time when all particles share a
-            clock. A sample that spans more levels makes the window grow to that span.
-
-        Returns
-        -------
-        FieldSet
-            ``self``, to allow chaining.
-        """
-        for model in self.models:
-            model.to_gpu_arrays(max_levels=max_levels)
-        return self
-
-    @property
-    def uses_gpu_arrays(self) -> bool:
-        return any(model.uses_gpu_arrays for model in self.models)
 
     @property
     def array_placement(self) -> ArrayPlacement:
