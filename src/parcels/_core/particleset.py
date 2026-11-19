@@ -12,9 +12,15 @@ from tqdm import tqdm
 
 from parcels._core.kernel import Kernel
 from parcels._core.particle import Particle, create_particle_data
-from parcels._core.particlesetview import ParticleSetView
+from parcels._core.particlesetview import ParticleSetView, _raise_if_out_of_bounds, _values_like
 from parcels._core.statuscodes import StatusCode
-from parcels._core.utils.array_backend import NUMPY_PLACEMENT, array_namespace
+from parcels._core.utils.array_backend import (
+    NUMPY_PLACEMENT,
+    array_namespace,
+    asarray_like,
+    device_of,
+    flatnonzero,
+)
 from parcels._core.utils.time import (
     TimeInterval,
     float_to_datelike,
@@ -188,7 +194,7 @@ class ParticleSet:
         if name in ["_data"]:
             object.__setattr__(self, name, value)
         elif isinstance(self._data, dict) and name in self._data.keys():
-            self._data[name][:] = value
+            self._data[name][...] = _values_like(value, self._data[name])
         else:
             object.__setattr__(self, name, value)
 
@@ -200,7 +206,7 @@ class ParticleSet:
         return particleset_repr(self)
 
     def __len__(self):
-        return len(self._data["particle_id"])
+        return self._data["particle_id"].shape[0]
 
     def add(self, particles):
         """Add particles to the ParticleSet. Note that this is an
@@ -230,15 +236,16 @@ class ParticleSet:
             self._data = particles._data
             return
 
+        xp = array_namespace(self._data["particle_id"])
         if isinstance(particles, type(self)):
-            if len(self._data["particle_id"]) > 0:
-                offset = self._data["particle_id"].max() + 1
+            if self._data["particle_id"].shape[0] > 0:
+                offset = xp.max(self._data["particle_id"]) + 1
             else:
                 offset = 0
             particles._data["particle_id"] = particles._data["particle_id"] + offset
 
         for d in self._data:
-            self._data[d] = np.concatenate((self._data[d], particles._data[d]))
+            self._data[d] = xp.concat((self._data[d], particles._data[d]))
 
         return self
 
@@ -263,15 +270,17 @@ class ParticleSet:
 
     def remove_indices(self, indices):
         """Method to remove particles from the ParticleSet, based on their `indices`."""
+        particles_to_keep = _particles_to_keep(indices, self._data["particle_id"])
         for d in self._data:
-            self._data[d] = np.delete(self._data[d], indices, axis=0)
+            self._data[d] = self._data[d][particles_to_keep]
 
     def populate_indices(self):
         """Pre-populate guesses of particle ei (element id) indices"""
         for i, grid in enumerate(self.fieldset.gridset):
             grid_positions = grid.search(self.z, self.y, self.x)
             axes = ("Z", "FACE") if isinstance(grid, UxGrid) else ("X", "Y", "Z")
-            self._data["ei"][:, i] = grid.ravel_index({axis: grid_positions[axis]["index"] for axis in axes})
+            ei = grid.ravel_index({axis: grid_positions[axis]["index"] for axis in axes})
+            self._data["ei"][:, i] = _values_like(ei, self._data["ei"])
 
     @classmethod
     def from_particlefile(cls, fieldset, pclass, filename, restart=True, restarttime=None, **kwargs):
@@ -326,10 +335,14 @@ class ParticleSet:
         compare_values = (
             np.array([compare_values]) if type(compare_values) not in [list, dict, np.ndarray] else compare_values
         )
-        compare_values = array_namespace(self._data[variable_name]).asarray(compare_values)
-        return np.where(np.isin(self._data[variable_name], compare_values, invert=invert))[
-            0
-        ]  # TODO check if this can be faster with xarray indexing?
+        values = self._data[variable_name]
+        xp = array_namespace(values)
+        compare_values = asarray_like(compare_values, like=values)
+        # isin's `invert` is not honoured by every library (array-api-strict 2.6 ignores it)
+        is_equal = xp.isin(values, compare_values)
+        return flatnonzero(
+            xp.logical_not(is_equal) if invert else is_equal
+        )  # TODO check if this can be faster with xarray indexing?
 
     @property
     def _error_particles(self):
@@ -340,7 +353,7 @@ class ParticleSet:
         indices
             Indices of error particles.
         """
-        return np.where(self._data["state"] != StatusCode.Success)[0]
+        return flatnonzero(self._data["state"] != StatusCode.Success)
 
     @property
     def _num_error_particles(self):
@@ -351,7 +364,7 @@ class ParticleSet:
         int
             Number of error particles.
         """
-        return int(np.sum(self._data["state"] != StatusCode.Success))
+        return int(array_namespace(self._data["state"]).count_nonzero(self._data["state"] != StatusCode.Success))
 
     def execute(
         self,
@@ -415,7 +428,8 @@ class ParticleSet:
         )
 
         # Set the time of the particles if it hadn't been set on initialisation
-        if np.isnan(self._data["t"]).any():
+        xp = array_namespace(self._data["t"])
+        if bool(xp.any(xp.isnan(self._data["t"]))):
             self._data["t"][:] = start_time
 
         outputdt = output_file.outputdt if output_file else None
@@ -473,9 +487,26 @@ class ParticleSet:
             pbar.close()
 
 
+def _particles_to_keep(indices, particle_ids):
+    """Boolean mask of the particles that ``np.delete(..., indices, axis=0)`` keeps.
+
+    Built with ``isin`` because not every array library assigns through an integer index array.
+    """
+    xp = array_namespace(particle_ids)
+    nparticles = particle_ids.shape[0]
+    indices = xp.reshape(asarray_like(indices, like=particle_ids), (-1,))
+    if indices.dtype == xp.bool:
+        return xp.logical_not(indices)
+    _raise_if_out_of_bounds(indices, nparticles)
+    indices = xp.where(indices < 0, indices + nparticles, indices)
+    all_indices = xp.arange(nparticles, dtype=indices.dtype, device=device_of(particle_ids))
+    return xp.logical_not(xp.isin(all_indices, indices))
+
+
 def _warn_outputdt_release_desync(outputdt: float, starttime: float, release_times: Iterable[float]):
     """Gives the user a warning if the release time isn't a multiple of outputdt."""
-    if outputdt and np.any(np.isfinite(release_times) & ((release_times - starttime) % outputdt != 0)):
+    xp = array_namespace(release_times)
+    if outputdt and bool(xp.any(xp.isfinite(release_times) & ((release_times - starttime) % outputdt != 0))):
         warnings.warn(
             "Some of the particles have a start time difference that is not a multiple of outputdt. "
             "This could cause the first output of some of the particles that start later "
@@ -541,10 +572,11 @@ def _get_simulation_start_and_end_times(
     if runtime is None and endtime is None:
         raise ValueError("Either runtime or endtime must be provided.")
 
+    xp = array_namespace(particle_release_times)
     if sign_dt == 1:
-        first_release_time = float(particle_release_times.min())
+        first_release_time = float(xp.min(particle_release_times))
     else:
-        first_release_time = float(particle_release_times.max())
+        first_release_time = float(xp.max(particle_release_times))
 
     if (time_interval is not None) and (endtime is not None):
         if type(endtime) != type(time_interval.left):  # noqa: E721

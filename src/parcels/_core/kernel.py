@@ -4,9 +4,8 @@ import types
 import warnings
 from typing import TYPE_CHECKING
 
-import numpy as np
-
 from parcels._core.basegrid import GridType
+from parcels._core.particlesetview import ParticleSetView
 from parcels._core.statuscodes import (
     StatusCode,
     _raise_field_interpolation_error,
@@ -16,6 +15,7 @@ from parcels._core.statuscodes import (
     _raise_grid_searching_error,
     _raise_outside_time_interval_error,
 )
+from parcels._core.utils.array_backend import array_namespace, flatnonzero
 from parcels._core.utils.kernel_linting import validate_kernel
 from parcels._core.warnings import FieldEvalWarning, KernelWarning
 from parcels.kernels import (
@@ -45,19 +45,25 @@ def _clip_dt_to_endtime(dt, time_to_endtime, compute_time_direction):
     clipped_dt :
         The clipped timestep array.
     dt_to_restore :
-        List of (indices, values) pairs with the original dt of each newly clipped
+        List of (mask, values) pairs with the original dt of each newly clipped
         particle, so the caller can restore them after the step.
     """
+    xp = array_namespace(dt, time_to_endtime)
     if compute_time_direction == 1:
-        clipped_dt = np.maximum(np.minimum(dt, time_to_endtime), 0)
+        clipped_dt = xp.maximum(xp.minimum(dt, time_to_endtime), 0)
     else:
-        clipped_dt = np.minimum(np.maximum(dt, -time_to_endtime), 0)
+        clipped_dt = xp.minimum(xp.maximum(dt, -time_to_endtime), 0)
 
     newly_clipped = clipped_dt != dt
-    indices = np.flatnonzero(newly_clipped)
-    dt_to_restore = [(indices, dt[indices].copy())] if indices.size else []
+    dt_to_restore = [(newly_clipped, dt[newly_clipped])] if bool(xp.any(newly_clipped)) else []
 
     return clipped_dt, dt_to_restore
+
+
+def _write_back(particles):
+    """Write what a kernel changed in a view back to the ParticleSet. A ParticleSet holds its arrays itself."""
+    if isinstance(particles, ParticleSetView):
+        particles._write_back()
 
 
 class Kernel:
@@ -196,18 +202,21 @@ class Kernel:
         if len(pset) == 0:
             return StatusCode.StopAllExecution
 
-        sign_dt = np.sign(pset.dt[0])
-        if np.any(np.sign(pset.dt) != sign_dt):
+        xp = array_namespace(pset.dt)
+        # A NumPy scalar endtime would turn particle arrays of other libraries into NumPy arrays
+        endtime = float(endtime)
+        sign_dt = xp.sign(pset.dt[0])
+        if bool(xp.any(xp.sign(pset.dt) != sign_dt)):
             raise ValueError("All particle timesteps must have the same sign dt")
 
         pset._data["state"][:] = StatusCode.Success
         preserve_particle_dt = not hasattr(self.fieldset, "RK45_tol")
 
-        while (len(pset) > 0) and np.any((pset.state == StatusCode.Success) | (pset.state == StatusCode.Repeat)):
+        while (len(pset) > 0) and bool(xp.any((pset.state == StatusCode.Success) | (pset.state == StatusCode.Repeat))):
             time_to_endtime = sign_dt * (endtime - pset.t)
 
             evaluate_particles = (pset.state == StatusCode.Success) & (time_to_endtime >= 0)
-            if not np.any(evaluate_particles):
+            if not bool(xp.any(evaluate_particles)):
                 return StatusCode.Success
 
             # adapt dt to end exactly on endtime
@@ -215,49 +224,57 @@ class Kernel:
 
             # When every particle is evaluated, a kernel gets the ParticleSet itself. A view would give the
             # same result, but reads and writes every particle variable through a boolean mask.
-            particles_to_evaluate = pset if np.all(evaluate_particles) else pset[evaluate_particles]
+            particles_to_evaluate = pset if bool(xp.all(evaluate_particles)) else pset[evaluate_particles]
 
             # run kernels for all particles that need to be evaluated
             for f in self._kernels:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", FieldEvalWarning)
 
-                    f(particles_to_evaluate, self._fieldset)
+                    try:
+                        f(particles_to_evaluate, self._fieldset)
+                    finally:
+                        _write_back(particles_to_evaluate)
 
                     # check for particles that have to be repeated
                     repeat_particles = pset.state == StatusCode.Repeat
-                    while np.any(repeat_particles):
-                        f(pset[repeat_particles], self._fieldset)
+                    while bool(xp.any(repeat_particles)):
+                        particles_to_repeat = pset[repeat_particles]
+                        try:
+                            f(particles_to_repeat, self._fieldset)
+                        finally:
+                            _write_back(particles_to_repeat)
                         repeat_particles = pset.state == StatusCode.Repeat
 
             # apply position/time update only to particles still in a normal state
             # (particles that signalled Stop*/Delete/errors should not have time/position advanced)
             update_particles = evaluate_particles & (pset.state == StatusCode.Success)
-            if np.any(update_particles):
+            if bool(xp.any(update_particles)):
                 pset.dt, newly_clipped = _clip_dt_to_endtime(pset.dt, time_to_endtime, sign_dt)
                 dt_to_restore.extend(newly_clipped)
-                particles_to_update = pset if np.all(update_particles) else pset[update_particles]
+                particles_to_update = pset if bool(xp.all(update_particles)) else pset[update_particles]
                 self._position_update(particles_to_update, self._fieldset)
+                _write_back(particles_to_update)
 
             # Set particle state for particles that reached endtime
             particles_endofloop = (pset.state == StatusCode.Success) & (pset.t == endtime)
             pset[particles_endofloop].state = StatusCode.EndofLoop
 
             if preserve_particle_dt:
-                for indices, values in dt_to_restore:
-                    pset.dt[indices] = values
+                for clipped, values in dt_to_restore:
+                    pset.dt[clipped] = values
 
             # delete particles that signalled deletion
-            indices = np.flatnonzero(pset.state == StatusCode.Delete)
-            if len(indices) > 0:
+            indices = flatnonzero(pset.state == StatusCode.Delete)
+            if indices.shape[0] > 0:
                 pset.remove_indices(indices)
 
             # check and throw errors
-            if np.any(pset.state == StatusCode.StopAllExecution):
+            if bool(xp.any(pset.state == StatusCode.StopAllExecution)):
                 return StatusCode.StopAllExecution
 
             for error_code, error_func in ErrorsToThrow.items():
-                if np.any(pset.state == error_code):
+                if bool(xp.any(pset.state == error_code)):
                     inds = pset.state == error_code
                     if error_code == StatusCode.ErrorOutsideTimeInterval:
                         error_func(pset[inds].t)
