@@ -15,7 +15,6 @@ from parcels._core.particle import Particle, create_particle_data
 from parcels._core.particlesetview import ParticleSetView, _raise_if_out_of_bounds, _values_like
 from parcels._core.statuscodes import StatusCode
 from parcels._core.utils.array_backend import (
-    NUMPY_PLACEMENT,
     array_namespace,
     asarray_like,
     device_of,
@@ -154,8 +153,7 @@ class ParticleSet:
             self._data[kwvar][:] = kwval
 
         placement = fieldset.array_placement
-        if placement != NUMPY_PLACEMENT:
-            self._data = {name: placement.asarray(values) for name, values in self._data.items()}
+        self._data = {name: placement.asarray(values) for name, values in self._data.items()}
 
         self._kernel = None
 
@@ -184,6 +182,8 @@ class ParticleSet:
         name : str
             Name of the property
         """
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         return self._data[name]
 
     def __getitem__(self, index):
@@ -194,7 +194,8 @@ class ParticleSet:
         if name in ["_data"]:
             object.__setattr__(self, name, value)
         elif isinstance(self._data, dict) and name in self._data.keys():
-            self._data[name][...] = _values_like(value, self._data[name])
+            if value is not self._data[name]:
+                self._data[name][...] = _values_like(value, self._data[name])
         else:
             object.__setattr__(self, name, value)
 
@@ -337,6 +338,9 @@ class ParticleSet:
         )
         values = self._data[variable_name]
         xp = array_namespace(values)
+        if isinstance(compare_values, list):
+            # NumPy's data type for the list (float64 for Python floats, where PyTorch would choose float32)
+            compare_values = np.asarray(compare_values)
         compare_values = asarray_like(compare_values, like=values)
         # isin's `invert` is not honoured by every library (array-api-strict 2.6 ignores it)
         is_equal = xp.isin(values, compare_values)

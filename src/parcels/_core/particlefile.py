@@ -205,9 +205,12 @@ def _get_vars_to_write(particle: ParticleClass) -> list[Variable]:
 
 
 def _rows_to_write(pset, name, indices):
-    """The values of variable `name` to write: the rows `indices` of the particle data, or all rows of a view."""
+    """The values of variable `name` to write: the rows `indices` of the particle data, or all rows of a view.
+
+    A view is read without adding to its cache, so that writing output never writes anything back.
+    """
     if indices is None:
-        return atleast_1d(getattr(pset, name))
+        return atleast_1d(pset._read(name))
     return pset._data[name][indices]
 
 

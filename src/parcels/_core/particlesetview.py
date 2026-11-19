@@ -1,61 +1,78 @@
-import weakref
+"""Views of some of the particles of a ParticleSet.
+
+Reading a variable of a view gathers the values of the selected particles into an array of the
+compute library. Assigning a variable writes values into the selected particles.
+
+The view that the kernel loop hands a kernel caches what it reads (``cache_arrays=True``). The first
+read of a variable gathers it from the ParticleSet's arrays and every later read returns that same
+array. Assigning the variable, or changing the array in place (``particles.state[mask] = code``),
+changes only that array. After each kernel call the kernel loop calls ``_write_back``, which writes
+each cached array to the ParticleSet's arrays once and drops the cache.
+
+A view taken from a view (``particles[mask]``) gathers from the values of the view it was taken from
+on every read, and assigning a variable writes into those values and assigns them back to that view.
+Taken from the kernel loop's view, it therefore reads and writes the cached arrays. Every other view
+caches nothing: each read gathers from the ParticleSet's arrays and each assignment writes straight
+into them. A view taken inside a kernel with a mask over the whole ParticleSet that selects particles
+the kernel loop's view does not, writes the kernel loop's cached array of a variable to the
+ParticleSet before using it, and reloads it after assigning to it.
+"""
 
 import numpy as np
 
 from parcels._core.utils.array_backend import array_namespace, asarray_like, device_of, flatnonzero, is_array
 from parcels._repr_utils import particlesetview_repr
 
-_VIEW_ATTRIBUTES = ("_data", "_index", "_pclass", "_parent", "_arrays", "_sources", "_write_backs")
+_VIEW_ATTRIBUTES = ("_data", "_index", "_pclass", "_parent", "_cache", "_caching_view")
 
 
 class ParticleSetView:
     """Class to be used in a kernel that links a View of the ParticleSet (on the kernel level) to a ParticleSet.
 
-    Reading a variable gathers the selected particles' values into an array of the compute library,
-    which the view keeps and hands out on every further read. Assigning a variable writes through to
-    the ParticleSet at once. Changes made in place to a handed-out array reach the ParticleSet when
-    the view writes back: on assignment of that variable, when `_write_back` is called (the kernel
-    loop does so after every kernel), and otherwise as soon as nothing holds the array any more.
-
-    A view of a view (``particles[mask]`` inside a kernel) gathers from, and writes back to, the
-    arrays of the view it was taken from, so neither ever holds values older than what the other wrote.
+    Only the view that the kernel loop hands a kernel returns the same array on every read. Any other
+    view gathers the values again on every read, so changing the array it returned in place, as in
+    ``pset[mask].x[0] = 1`` or ``particles[mask].x[0] = 1`` inside a kernel, is not written to the
+    ParticleSet. Assign the variable instead: ``view.x = values``.
     """
 
-    def __init__(self, data, index, pclass, parent=None):
+    def __init__(self, data, index, pclass, parent=None, *, cache_arrays=False):
         self._data = data
+        # `index` selects rows of the parent's values, or of the ParticleSet's arrays without a parent
         self._index = index if parent is not None else _normalize_index(index, data["particle_id"])
         self._pclass = pclass
         self._parent = parent
-        self._arrays = {}
-        self._sources = {}
-        self._write_backs = {}
+        self._cache = {} if cache_arrays else None
+        self._caching_view = None
 
     def __getattr__(self, name):
-        if name in _VIEW_ATTRIBUTES:
+        if name in _VIEW_ATTRIBUTES or (name.startswith("__") and name.endswith("__")):
             raise AttributeError(name)
-        if name in self._data:
-            # If this ParticleSetView represents a single particle (integer
-            # index), return the underlying scalar directly to preserve
-            # user-facing semantics (e.g., `pset[0].time` should be a number).
-            if isinstance(self._index, int):
-                return _gather_rows(self._data[name], self._index)
-            return self._get(name)
-        return self._data[name][self._index]
+        if name not in self._data:
+            return self._data[name][self._index]
+        if self._cache is None:
+            return self._read(name)
+        if name not in self._cache:
+            self._cache[name] = self._read(name)
+        return self._cache[name]
 
     def __setattr__(self, name, value):
         if name in _VIEW_ATTRIBUTES:
             object.__setattr__(self, name, value)
-        elif isinstance(self._index, int):
-            target = self._data[name]
-            _put_rows(target, self._index, _values_like(value, target))
-        elif name in self._arrays:
-            array = self._arrays[name]
+        elif self._cache is not None:
+            array = getattr(self, name)
             if value is not array:
                 array[...] = _values_like(value, array)
-            self._write_back_variable(name)
+        elif self._parent is not None:
+            parent_values = getattr(self._parent, name)
+            _put_rows(parent_values, self._index, _values_like(value, parent_values))
+            setattr(self._parent, name, parent_values)
         else:
-            source = self._source(name)
-            _write_rows_to(self._owner(), name, source, self._index, _values_like(value, source))
+            if self._caching_view is not None:
+                self._caching_view._flush(name)
+            target = self._data[name]
+            _put_rows(target, self._index, _values_like(value, target))
+            if self._caching_view is not None:
+                self._caching_view._refresh(name)
 
     def __repr__(self):
         return particlesetview_repr(self)
@@ -76,15 +93,15 @@ class ParticleSetView:
             index = asarray_like(index, like=reference)
             if index.dtype == xp.bool:
                 if index.shape[0] == reference.shape[0]:
-                    # global mask
-                    local_mask = self._select(index)
-                elif index.shape[0] == nselected:
-                    local_mask = index
-                else:
+                    # global mask: the particles it selects, whether or not this view selects them
+                    return self._view_of_particleset_mask(index)
+                if index.shape[0] != nselected:
                     raise ValueError(
                         f"Boolean index has incompatible length {index.shape[0]} for selection of size {nselected}"
                     )
-                return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
+                return ParticleSetView(self._data, index, self._pclass, parent=self)
+            if not _is_integer_array(index):
+                raise IndexError("arrays used as indices must be of integer (or boolean) type")
 
         # Integer array/list, slice or single integer relative to the local view
         # (boolean masks were handled above). A view of a view selects with a
@@ -99,7 +116,7 @@ class ParticleSetView:
             local_mask[index] = True
             return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
 
-        # Fallback: try to assign directly (preserves previous behaviour for other index types)
+        # Fallback: try to assign directly
         try:
             local_mask[...] = index
             return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
@@ -107,50 +124,57 @@ class ParticleSetView:
             raise TypeError(f"Unsupported index type for ParticleSetView.__getitem__: {type(index)!r}") from e
 
     def __len__(self):
+        # The parent's length: for a boolean mask view that is the ParticleSet's length, not the number selected
         if self._parent is not None:
             return len(self._parent)
         if is_array(self._index):
             return self._index.shape[0]
         return len(self._index)
 
-    def _owner(self):
-        """Where this view's selection points into: the enclosing view, or the ParticleSet's data."""
-        return self._data if self._parent is None else self._parent
-
-    def _source(self, name):
-        """The array of `name` that this view's selection indexes."""
-        if self._parent is None:
-            return self._data[name]
-        return self._parent._get(name)
-
-    def _get(self, name):
-        """The array of `name` for the selected particles, gathered on first use."""
-        array = self._arrays.get(name)
-        if array is None:
-            source = self._source(name)
-            gathered = _gather_rows(source, self._index)
-            # The view hands out an alias of the gathered array, so that once the view and every user
-            # have let go of it, the finalizer can still write the gathered values back.
-            array = gathered[...]
-            write_back = weakref.finalize(array, _write_rows_to, self._owner(), name, source, self._index, gathered)
-            write_back.atexit = False
-            self._arrays[name] = array
-            self._sources[name] = source
-            self._write_backs[name] = write_back
-        return array
-
-    def _write_back_variable(self, name):
-        """Write the array gathered for `name` into the view's parent, and from there up to the ParticleSet."""
-        _write_rows_to(self._owner(), name, self._sources[name], self._index, self._arrays[name])
+    def _read(self, name):
+        """The selected particles' values of `name`: the cached array if there is one, otherwise gathered."""
+        if self._cache is not None and name in self._cache:
+            return self._cache[name]
+        if self._parent is not None:
+            return _gather_rows(getattr(self._parent, name), self._index)
+        if self._caching_view is not None:
+            self._caching_view._flush(name)
+        return _gather_rows(self._data[name], self._index)
 
     def _write_back(self):
-        """Write every gathered array back to the ParticleSet and let go of them, so the next read gathers again."""
-        for name in list(self._arrays):
-            self._write_back_variable(name)
-            self._write_backs[name].detach()
-        self._arrays.clear()
-        self._sources.clear()
-        self._write_backs.clear()
+        """Write each cached array to the ParticleSet once and drop the cache, so that the next read gathers again."""
+        for name in self._cache:
+            self._flush(name)
+        self._cache.clear()
+
+    def _flush(self, name):
+        """Write the cached array of `name`, if there is one, to the ParticleSet, and keep it cached."""
+        if name in self._cache:
+            _put_rows(self._data[name], self._index, self._cache[name])
+
+    def _refresh(self, name):
+        """Update the cached array of `name`, if there is one, in place from the ParticleSet."""
+        if name in self._cache:
+            self._cache[name][...] = _gather_rows(self._data[name], self._index)
+
+    def _view_of_particleset_mask(self, mask):
+        """A view of the particles that `mask`, with one entry per particle of the ParticleSet, selects."""
+        top = self
+        while top._parent is not None:
+            top = top._parent
+        caching_view = top if top._cache is not None else top._caching_view
+        if caching_view is None:
+            return ParticleSetView(self._data, mask, self._pclass)
+
+        # Inside the kernel loop, the particles must be read and written where the newest values are: in
+        # the kernel loop's cached arrays for its own particles (it selects them with a boolean mask)
+        xp = array_namespace(mask)
+        local_mask = _gather_rows(mask, caching_view._index)
+        if int(xp.count_nonzero(local_mask)) == int(xp.count_nonzero(mask)):
+            return ParticleSetView(self._data, local_mask, self._pclass, parent=caching_view)
+        view = ParticleSetView(self._data, mask, self._pclass)
+        view._caching_view = caching_view
+        return view
 
     def _size(self):
         """Number of particles that this view selects."""
@@ -159,12 +183,6 @@ class ParticleSetView:
         if self._index.dtype == array_namespace(self._index).bool:
             return int(array_namespace(self._index).count_nonzero(self._index))
         return self._index.shape[0]
-
-    def _select(self, values):
-        """The entries of `values`, which has one entry per particle in the ParticleSet, that this view selects."""
-        if self._parent is not None:
-            values = self._parent._select(values)
-        return _gather_rows(values, self._index)
 
 
 def _is_array_or_list(index) -> bool:
@@ -178,16 +196,22 @@ def _is_integer_array(index) -> bool:
 def _normalize_index(index, reference):
     """A ParticleSet index as a Python int (a single particle), a slice, or an array of the library of `reference`.
 
-    Negative entries of integer arrays are wrapped, since not every library gathers with them.
+    Negative entries of integer arrays are wrapped, since not every library gathers with them. Entries
+    out of range are kept, so that reading or writing through the index raises IndexError.
     """
     if isinstance(index, tuple) and len(index) == 1:
         index = index[0]
     if isinstance(index, np.integer) or (is_array(index) and index.ndim == 0):
         return int(index)
+    if isinstance(index, list) and len(index) == 0:
+        # NumPy indexes with an empty list as with an empty integer array
+        return asarray_like(index, like=reference, dtype="int64")
     if _is_array_or_list(index):
         index = asarray_like(index, like=reference)
         if _is_integer_array(index):
-            index = array_namespace(index).where(index < 0, index + reference.shape[0], index)
+            nparticles = reference.shape[0]
+            in_range_negative = (index < 0) & (index >= -nparticles)
+            index = array_namespace(index).where(in_range_negative, index + nparticles, index)
     return index
 
 
@@ -203,19 +227,24 @@ def _raise_if_out_of_bounds(indices, size: int):
 def _values_like(value, target):
     """`value` ready to be assigned into `target`: an array of the library, device and data type of `target`.
 
-    Python scalars are passed on as they are.
+    Python scalars are passed on as they are. Other non-arrays (lists) are built in the data type of
+    `target` directly, as PyTorch would otherwise build Python floats in float32.
     """
     if not is_array(value) and isinstance(value, (bool, int, float, complex)):
         return value
+    xp = array_namespace(target)
+    if not is_array(value):
+        return xp.asarray(value, dtype=target.dtype, device=device_of(target))
     value = asarray_like(value, like=target)
     if value.dtype != target.dtype:
-        value = array_namespace(target).astype(value, target.dtype)
+        value = xp.astype(value, target.dtype)
     return value
 
 
 def _gather_rows(source, index):
     """The rows of `source` (one row per particle) that `index` selects."""
     if _is_integer_array(index):
+        _raise_if_out_of_bounds(index, source.shape[0])
         return array_namespace(source).take(source, index, axis=0)
     if source.ndim > 1 and not is_array(index):
         return source[index, ...]
@@ -235,6 +264,7 @@ def _put_rows(target, index, values):
             target[index] = values
         return
 
+    _raise_if_out_of_bounds(index, target.shape[0])
     xp = array_namespace(target)
     nselected = index.shape[0]
     if nselected == 0:
@@ -249,19 +279,3 @@ def _put_rows(target, index, values):
     last_selection = xp.where(is_selected, last_selection, 0)
     is_selected = is_selected & (xp.take(sorted_rows, last_selection) == all_rows)
     target[is_selected] = xp.take(values, xp.take(order, last_selection[is_selected]), axis=0)
-
-
-def _write_rows_to(owner, name, source, index, values):
-    """Write `values` into the rows `index` of `source`, which is `owner`'s array of `name`.
-
-    A view as `owner` passes the write on to its own parent. Nothing is written once `owner` no
-    longer holds `source` (a view that wrote back and let go of its arrays, or a ParticleSet whose
-    arrays were replaced when particles were added or removed): the selection no longer applies.
-    """
-    if isinstance(owner, ParticleSetView):
-        if owner._arrays.get(name) is not source:
-            return
-        _put_rows(source, index, values)
-        owner._write_back_variable(name)
-    elif owner.get(name) is source:
-        _put_rows(source, index, values)
