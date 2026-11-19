@@ -170,7 +170,8 @@ def rad2deg(angle_rad: Any) -> Any:
 def isclose(a: Any, b: Any, *, rtol: float = 1e-5, atol: float = 1e-8) -> Any:
     """Elementwise ``|a - b| <= atol + rtol * |b|``, as ``np.isclose`` without NaN handling."""
     xp = array_namespace(a, b)
-    return xp.abs(a - b) <= atol + rtol * xp.abs(b)
+    magnitude_of_b = xp.abs(b) if is_array_api_obj(b) else abs(b)
+    return xp.abs(a - b) <= atol + rtol * magnitude_of_b
 
 
 def nanmin(array: Any) -> Any:
