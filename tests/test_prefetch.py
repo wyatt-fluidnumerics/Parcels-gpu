@@ -5,6 +5,8 @@ worker process imports PyTorch and Parcels.
 """
 
 import functools
+import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -300,15 +302,29 @@ def test_dataloader_prefetcher_worker_reads_levels_in_order_and_shuts_down(torch
 
 
 @pytest.mark.slow
+def test_dataloader_prefetcher_reports_a_killed_worker_and_stops_the_others(torch, levels):
+    read = _TimeLevelReader(da.from_array(levels, chunks=(1, 3, 4)))
+    prefetcher = DataLoaderPrefetcher(read, num_workers=2, prefetch_factor=1)
+    prefetcher.request(list(range(6)) * 4)
+    prefetcher.take(0)
+    workers = list(prefetcher._loader._iterator._workers)
+    os.kill(workers[0].pid, signal.SIGKILL)
+
+    with pytest.raises(RuntimeError, match="killed for using too much memory"):
+        for level in list(range(1, 6)) + list(range(6)) * 3:
+            prefetcher.take(level)
+    assert not any(worker.is_alive() for worker in workers)
+    prefetcher.close()
+
+
+@pytest.mark.slow
 def test_dataloader_prefetcher_worker_reads_lazily_opened_netcdf(torch, tmp_path, levels):
     path = tmp_path / "levels.nc"
     xr.Dataset({"U": (("time", "y", "x"), levels)}).to_netcdf(path)
     with xr.open_dataset(path, chunks={"time": 1}) as ds:
         lazy = ds["U"].data
         assert isinstance(lazy, da.Array)
-        windowed = WindowedArray(
-            lazy, windowed=True, prefetcher=functools.partial(DataLoaderPrefetcher, num_workers=1)
-        )
+        windowed = WindowedArray(lazy, windowed=True, prefetcher=functools.partial(DataLoaderPrefetcher, num_workers=1))
         spatial = (np.array([0, 2]), np.array([1, 3]))
         for lowest in range(5):
             time_index = np.array([lowest, lowest + 1])

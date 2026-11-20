@@ -88,6 +88,10 @@ class DataLoaderPrefetcher:
         Keys read ahead per worker. Defaults to two. Ignored when ``num_workers`` is zero.
     pin_memory : bool, optional
         Return page-locked tensors, for faster copies to a CUDA device. Defaults to False.
+    read_timeout_s : float, optional
+        Longest time to wait for one key from the worker processes before raising. Defaults to zero,
+        which waits without limit. A worker that has exited is noticed either way; the limit is for
+        workers that are alive but stalled, for example when the node is out of memory.
     multiprocessing_context : str or multiprocessing context, optional
         How worker processes are started. Defaults to "forkserver" where the platform has it and
         "spawn" otherwise, never "fork": the parent runs threads (dask, PyTorch), and forked workers
@@ -102,6 +106,7 @@ class DataLoaderPrefetcher:
         num_workers: int = 1,
         prefetch_factor: int = 2,
         pin_memory: bool = False,
+        read_timeout_s: float = 0.0,
         multiprocessing_context: Any = None,
     ) -> None:
         torch = _import_torch()
@@ -120,6 +125,7 @@ class DataLoaderPrefetcher:
             num_workers=num_workers,
             prefetch_factor=prefetch_factor if uses_workers else None,
             pin_memory=pin_memory,
+            timeout=read_timeout_s if uses_workers else 0,
             persistent_workers=uses_workers,
             worker_init_fn=_use_synchronous_dask_scheduler if uses_workers else None,
             multiprocessing_context=multiprocessing_context if uses_workers else None,
@@ -158,6 +164,19 @@ class DataLoaderPrefetcher:
         started_waiting = time.perf_counter()
         try:
             return next(self._iterator)
+        except RuntimeError as error:
+            # PyTorch reports a worker process that exited, or a read that exceeded the time limit,
+            # as a RuntimeError that names the DataLoader. The loader cannot continue after either, so
+            # its workers are stopped. An error raised by ``read`` itself is passed on as it is.
+            if "DataLoader" not in str(error):
+                raise
+            self.close()
+            raise RuntimeError(
+                f"The DataLoader prefetcher could not read key {key!r}: {error}. A worker process that exits "
+                "unexpectedly has most often been killed for using too much memory; each worker holds its own "
+                "copy of the reader and of the keys it has read ahead. Use fewer workers, a smaller "
+                "prefetch_factor, or more memory."
+            ) from error
         finally:
             self.wait_seconds += time.perf_counter() - started_waiting
 
