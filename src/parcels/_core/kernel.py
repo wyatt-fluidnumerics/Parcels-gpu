@@ -15,7 +15,7 @@ from parcels._core.statuscodes import (
     _raise_grid_searching_error,
     _raise_outside_time_interval_error,
 )
-from parcels._core.utils.array_backend import array_namespace, flatnonzero
+from parcels._core.utils.array_backend import array_namespace, flatnonzero, to_numpy
 from parcels._core.utils.kernel_linting import validate_kernel
 from parcels._core.warnings import FieldEvalWarning, KernelWarning
 from parcels.kernels import (
@@ -60,10 +60,23 @@ def _clip_dt_to_endtime(dt, time_to_endtime, compute_time_direction):
     return clipped_dt, dt_to_restore
 
 
+def _kernel_view(pset, particles_to_run):
+    """The view of the particles in the mask `particles_to_run` that a kernel gets.
+
+    It caches the arrays the kernel reads and changes, until `_write_back` writes them to the ParticleSet.
+    """
+    return ParticleSetView(pset._data, particles_to_run, pset._pclass, cache_arrays=True)
+
+
 def _write_back(particles):
     """Write what a kernel changed in a view back to the ParticleSet. A ParticleSet holds its arrays itself."""
     if isinstance(particles, ParticleSetView):
         particles._write_back()
+
+
+def _as_numpy_repr(values) -> str:
+    """`values` as NumPy represents them, so that error messages read the same for every array library."""
+    return repr(to_numpy(values))
 
 
 class Kernel:
@@ -224,7 +237,10 @@ class Kernel:
 
             # When every particle is evaluated, a kernel gets the ParticleSet itself. A view would give the
             # same result, but reads and writes every particle variable through a boolean mask.
-            particles_to_evaluate = pset if bool(xp.all(evaluate_particles)) else pset[evaluate_particles]
+            if bool(xp.all(evaluate_particles)):
+                particles_to_evaluate = pset
+            else:
+                particles_to_evaluate = _kernel_view(pset, evaluate_particles)
 
             # run kernels for all particles that need to be evaluated
             for f in self._kernels:
@@ -239,7 +255,7 @@ class Kernel:
                     # check for particles that have to be repeated
                     repeat_particles = pset.state == StatusCode.Repeat
                     while bool(xp.any(repeat_particles)):
-                        particles_to_repeat = pset[repeat_particles]
+                        particles_to_repeat = _kernel_view(pset, repeat_particles)
                         try:
                             f(particles_to_repeat, self._fieldset)
                         finally:
@@ -252,9 +268,11 @@ class Kernel:
             if bool(xp.any(update_particles)):
                 pset.dt, newly_clipped = _clip_dt_to_endtime(pset.dt, time_to_endtime, sign_dt)
                 dt_to_restore.extend(newly_clipped)
-                particles_to_update = pset if bool(xp.all(update_particles)) else pset[update_particles]
-                self._position_update(particles_to_update, self._fieldset)
-                _write_back(particles_to_update)
+                particles_to_update = pset if bool(xp.all(update_particles)) else _kernel_view(pset, update_particles)
+                try:
+                    self._position_update(particles_to_update, self._fieldset)
+                finally:
+                    _write_back(particles_to_update)
 
             # Set particle state for particles that reached endtime
             particles_endofloop = (pset.state == StatusCode.Success) & (pset.t == endtime)
@@ -277,8 +295,10 @@ class Kernel:
                 if bool(xp.any(pset.state == error_code)):
                     inds = pset.state == error_code
                     if error_code == StatusCode.ErrorOutsideTimeInterval:
-                        error_func(pset[inds].t)
+                        error_func(_as_numpy_repr(pset[inds].t))
                     else:
-                        error_func(pset[inds].z, pset[inds].y, pset[inds].x)
+                        error_func(
+                            _as_numpy_repr(pset[inds].z), _as_numpy_repr(pset[inds].y), _as_numpy_repr(pset[inds].x)
+                        )
 
         return pset

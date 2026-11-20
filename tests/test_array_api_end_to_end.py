@@ -14,6 +14,7 @@ a few units in the last place.
 """
 
 import importlib
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -31,7 +32,7 @@ from parcels import FieldOutOfBoundError, FieldSet, Particle, ParticleFile, Part
 from parcels._core.mesh import FlatMesh, SphericalMesh
 from parcels._core.particle import ParticleClass
 from parcels._core.utils.array_backend import ArrayPlacement, array_namespace, namespace_of_library, to_numpy
-from parcels._core.warnings import FieldSetWarning
+from parcels._core.warnings import FieldEvalWarning, FieldSetWarning
 from parcels._datasets.structured.generated import peninsula_dataset, simple_UV_dataset, simple_UV_sigma_dataset
 from parcels.interpolators import XFreeslip, XPartialslip
 from parcels.kernels import (
@@ -736,3 +737,30 @@ def test_particlefile_matches_numpy(xp, tmp_path):
     # written before their first sample) as unequal to itself.
     for name in expected.column_names:
         assert_bitwise_equal(table.column(name).to_numpy(), expected.column(name).to_numpy(), name)
+
+
+def test_sampling_a_view_outside_a_kernel_updates_its_particles(xp):
+    """Sampling a field at a view made outside the kernel loop writes element indices and states to the ParticleSet."""
+    fieldset = _rectilinear_agrid_fieldset("flat", field_names=("U", "V", "T"))()
+    _hold_field_data_in(fieldset, xp)
+    release = rectilinear_positions("flat", 6)
+    release["x"][4] = 700e3  # east of the grid
+    release["t"] = np.full(6, HOUR)
+    selected = np.array([True, False, True, False, True, True])
+
+    whole = ParticleSet(fieldset, **release)
+    through_view = ParticleSet(fieldset, **release)
+    through_view.ei[...] = 0
+    initial = {name: to_numpy(values).copy() for name, values in through_view._data.items()}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FieldEvalWarning)
+        expected_values = fieldset.T[whole]
+        values = fieldset.T[through_view[xp.asarray(selected)]]
+
+    assert_bitwise_equal(to_numpy(values), to_numpy(expected_values)[selected], "T")
+    for name in ("ei", "state"):
+        expected = initial[name].copy()
+        expected[selected] = to_numpy(whole._data[name])[selected]
+        assert_bitwise_equal(to_numpy(through_view._data[name]), expected, name)
+    assert to_numpy(through_view.state)[4] == StatusCode.ErrorOutOfBounds
+    assert np.all(to_numpy(through_view.ei)[selected] != initial["ei"][selected])
