@@ -566,6 +566,7 @@ SIMULATIONS["agrid-flat-InPlaceAdvectionEE"] = Simulation(
 )
 SIMULATIONS["sigma-time-varying-depth-AdvectionRK4_3D"] = _sigma_depth()
 
+
 @dataclass(frozen=True)
 class KnownFailure:
     reason: str

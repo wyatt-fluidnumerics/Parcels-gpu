@@ -449,7 +449,14 @@ def test_cached_per_placement_converts_once_per_library_and_device(library):
 
 def test_nbytes_of(library):
     xp = namespace_of_library(library)
-    for dtype_name, itemsize in [("bool", 1), ("int8", 1), ("int32", 4), ("float32", 4), ("float64", 8), ("complex128", 16)]:
+    for dtype_name, itemsize in [
+        ("bool", 1),
+        ("int8", 1),
+        ("int32", 4),
+        ("float32", 4),
+        ("float64", 8),
+        ("complex128", 16),
+    ]:
         assert nbytes_of(xp.zeros((3, 5), dtype=getattr(xp, dtype_name))) == 15 * itemsize, dtype_name
     assert nbytes_of(None) == 0
     assert nbytes_of([1.0, 2.0]) == 0

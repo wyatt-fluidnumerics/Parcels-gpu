@@ -299,9 +299,7 @@ def _spherical_project_cell_and_query(clon, clat, x, y):
     """
     xp = array_namespace(x)
     cX, cY, cZ = _latlon_rad_to_xyz(deg2rad(clat), deg2rad(clon))  # (4, N) each
-    qX, qY, qZ = _latlon_rad_to_xyz(
-        deg2rad(xp.asarray(y, dtype=xp.float64)), deg2rad(xp.asarray(x, dtype=xp.float64))
-    )
+    qX, qY, qZ = _latlon_rad_to_xyz(deg2rad(xp.asarray(y, dtype=xp.float64)), deg2rad(xp.asarray(x, dtype=xp.float64)))
 
     # Cell-intrinsic tangent basis from edge-midpoint difference vectors.
     # Corner order is CCW: c0=(yi,xi), c1=(yi,xi+1), c2=(yi+1,xi+1), c3=(yi+1,xi).

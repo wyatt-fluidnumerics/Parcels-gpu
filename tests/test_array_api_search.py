@@ -252,9 +252,7 @@ def test_time_varying_depth_search_needs_numpy(xp, sigma_field):
 
 def test_ravel_unravel_index_round_trip(xp, rectilinear_grid):
     rng = np.random.default_rng(4)
-    axis_indices = {
-        axis: rng.integers(0, rectilinear_grid.get_axis_dim(axis), 100) for axis in rectilinear_grid.axes
-    }
+    axis_indices = {axis: rng.integers(0, rectilinear_grid.get_axis_dim(axis), 100) for axis in rectilinear_grid.axes}
     expected_ei = rectilinear_grid.ravel_index(axis_indices)
 
     ei = rectilinear_grid.ravel_index({axis: xp.asarray(index) for axis, index in axis_indices.items()})

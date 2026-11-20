@@ -114,9 +114,7 @@ def AdvectionRK45(particles, fieldset):  # pragma: no cover
     particles.dy = particles.dy + xp.where(good_particles, y_5th, 0)
 
     increase_dt_particles = (
-        good_particles
-        & (kappa <= fieldset.RK45_tol / 10)
-        & (xp.abs(particles.dt * 2) <= abs(fieldset.RK45_max_dt))
+        good_particles & (kappa <= fieldset.RK45_tol / 10) & (xp.abs(particles.dt * 2) <= abs(fieldset.RK45_max_dt))
     )
     particles.next_dt = xp.where(increase_dt_particles, particles.dt * 2, particles.dt)
     particles.next_dt = xp.where(

@@ -31,8 +31,8 @@ from typing import Any
 import array_api_compat
 import array_api_compat.numpy as compat_numpy
 import numpy as np
-from array_api_compat import is_array_api_obj, is_numpy_array, to_device
 from array_api_compat import device as device_of
+from array_api_compat import is_array_api_obj, is_numpy_array, to_device
 
 __all__ = [
     "NUMPY_PLACEMENT",

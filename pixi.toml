@@ -216,7 +216,13 @@ test-py315 = { features = ["test", "py315"] }
 test-notebooks = { features = ["test", "notebooks"], solve-group = "main" }
 docs = { features = ["docs", "notebooks"], solve-group = "docs" }
 typing = { features = ["typing"], solve-group = "main" }
-array-api-gpu = { features = ["test", "devtools", "gpu-cuda12", "array-api", "torch-cuda12"], solve-group = "array-api-gpu" }
+array-api-gpu = { features = [
+  "test",
+  "devtools",
+  "gpu-cuda12",
+  "array-api",
+  "torch-cuda12",
+], solve-group = "array-api-gpu" }
 
 [pypi-dependencies]
 detect-test-pollution = ">=1.2.0, <2"
