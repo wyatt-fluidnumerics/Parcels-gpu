@@ -266,12 +266,15 @@ class FieldSet:
     @property
     def array_placement(self) -> ArrayPlacement:
         """The array library, and device, that field data is returned in. Particle data is held there too."""
-        placements = {model.array_placement for model in self.models}
+        placements: list[ArrayPlacement] = []
+        for model in self.models:
+            if model.array_placement not in placements:
+                placements.append(model.array_placement)
         if len(placements) > 1:
             raise ValueError(
                 f"The models of this FieldSet hold their fields in more than one array library or device: {placements}"
             )
-        return placements.pop() if placements else NUMPY_PLACEMENT
+        return placements[0] if placements else NUMPY_PLACEMENT
 
     def add_constant_field(self, name: str, value):
         """Wrapper function to add a Field that is constant in space,

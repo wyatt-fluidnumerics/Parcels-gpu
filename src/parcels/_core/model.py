@@ -95,16 +95,19 @@ class ModelData(ABC):
         A Parcels backend reports its own. Field data held eagerly in an array library is returned in
         that library. Lazily loaded data is computed to NumPy.
         """
-        placements = set()
+        # A list, compared with ==, because the device objects of some libraries (CuPy) are not hashable
+        placements: list[ArrayPlacement] = []
         for name in self.scalar_field_names:
             data = self.data.variables[name]._data
             placement = getattr(data, "array_placement", None)
             if placement is None and is_array(data) and not is_dask_collection(data):
                 placement = ArrayPlacement.of(data)
-            placements.add(NUMPY_PLACEMENT if placement is None else placement)
+            placement = NUMPY_PLACEMENT if placement is None else placement
+            if placement not in placements:
+                placements.append(placement)
         if len(placements) > 1:
             raise ValueError(f"The fields of one model are held in more than one array library or device: {placements}")
-        return placements.pop() if placements else NUMPY_PLACEMENT
+        return placements[0] if placements else NUMPY_PLACEMENT
 
     def _assert_supports_array_library(self, array_library: ModuleType | None, device: Any, backend: str) -> None:
         if placement_of_library(array_library, device) == NUMPY_PLACEMENT:

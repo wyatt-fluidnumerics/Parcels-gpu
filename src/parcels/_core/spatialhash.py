@@ -361,8 +361,9 @@ class SpatialHash:
         del face_ids
         # Perform a single sort on the packed (morton_code | face_id ) list
         packed.sort()
-        # Trunctating back to a uint32 keeps the lower 32 bits (the face_id's)
-        face_sorted = packed.astype(np.uint32)
+        # Trunctating back to a uint32 keeps the lower 32 bits (the face_id's). They are then kept in a signed
+        # type, which every array library can gather from (PyTorch cannot index uint32 arrays on a GPU).
+        face_sorted = packed.astype(np.uint32).astype(np.int32 if nface <= np.iinfo(np.int32).max else np.int64)
         # Purge the face ids from the packed list to retain only the morton codes
         packed >>= np.uint64(32)
         # Cast the morton codes back to uint32
