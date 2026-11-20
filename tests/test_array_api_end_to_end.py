@@ -588,9 +588,11 @@ EXPECTED_FAILURES: dict[tuple[str, str], KnownFailure] = {
     ("array_api_strict", "curvilinear-land-XPartialslip-AdvectionRK2"): _MIXED_FLOAT_WRITE,
     ("array_api_strict", "agrid-flat-InPlaceAdvectionEE"): _MIXED_FLOAT_WRITE,
     ("array_api_strict", "sigma-time-varying-depth-AdvectionRK4_3D"): KnownFailure(
-        _TIME_VARYING_DEPTH_IS_NUMPY_ONLY, AttributeError
+        _TIME_VARYING_DEPTH_IS_NUMPY_ONLY, NotImplementedError
     ),
-    ("torch", "sigma-time-varying-depth-AdvectionRK4_3D"): KnownFailure(_TIME_VARYING_DEPTH_IS_NUMPY_ONLY, TypeError),
+    ("torch", "sigma-time-varying-depth-AdvectionRK4_3D"): KnownFailure(
+        _TIME_VARYING_DEPTH_IS_NUMPY_ONLY, NotImplementedError
+    ),
 }
 
 

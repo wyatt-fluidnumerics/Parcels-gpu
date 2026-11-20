@@ -20,7 +20,15 @@ ParticleSet before using it, and reloads it after assigning to it.
 
 import numpy as np
 
-from parcels._core.utils.array_backend import array_namespace, asarray_like, device_of, flatnonzero, is_array
+from parcels._core.utils.array_backend import (
+    array_namespace,
+    asarray_like,
+    device_of,
+    flatnonzero,
+    indices_to_mask,
+    is_array,
+    values_like,
+)
 from parcels._repr_utils import particlesetview_repr
 
 _VIEW_ATTRIBUTES = ("_data", "_index", "_pclass", "_parent", "_cache", "_caching_view")
@@ -61,16 +69,16 @@ class ParticleSetView:
         elif self._cache is not None:
             array = getattr(self, name)
             if value is not array:
-                array[...] = _values_like(value, array)
+                array[...] = values_like(value, array)
         elif self._parent is not None:
             parent_values = getattr(self._parent, name)
-            _put_rows(parent_values, self._index, _values_like(value, parent_values))
+            _put_rows(parent_values, self._index, values_like(value, parent_values))
             setattr(self._parent, name, parent_values)
         else:
             if self._caching_view is not None:
                 self._caching_view._flush(name)
             target = self._data[name]
-            _put_rows(target, self._index, _values_like(value, target))
+            _put_rows(target, self._index, values_like(value, target))
             if self._caching_view is not None:
                 self._caching_view._refresh(name)
 
@@ -107,9 +115,7 @@ class ParticleSetView:
         # (boolean masks were handled above). A view of a view selects with a
         # boolean mask over the particles of the view it is taken from.
         if is_array(index):
-            _raise_if_out_of_bounds(index, nselected)
-            positions = xp.astype(xp.where(index < 0, index + nselected, index), xp.int64)
-            local_mask = xp.isin(xp.arange(nselected, dtype=xp.int64, device=device_of(reference)), positions)
+            local_mask = indices_to_mask(index, nselected)
             return ParticleSetView(self._data, local_mask, self._pclass, parent=self)
         local_mask = xp.zeros(nselected, dtype=xp.bool, device=device_of(reference))
         if isinstance(index, (slice, int)):
@@ -222,23 +228,6 @@ def _raise_if_out_of_bounds(indices, size: int):
     if bool(xp.any(out_of_bounds)):
         first = int(xp.reshape(indices, (-1,))[flatnonzero(xp.reshape(out_of_bounds, (-1,)))[0]])
         raise IndexError(f"index {first} is out of bounds for axis 0 with size {size}")
-
-
-def _values_like(value, target):
-    """`value` ready to be assigned into `target`: an array of the library, device and data type of `target`.
-
-    Python scalars are passed on as they are. Other non-arrays (lists) are built in the data type of
-    `target` directly, as PyTorch would otherwise build Python floats in float32.
-    """
-    if not is_array(value) and isinstance(value, (bool, int, float, complex)):
-        return value
-    xp = array_namespace(target)
-    if not is_array(value):
-        return xp.asarray(value, dtype=target.dtype, device=device_of(target))
-    value = asarray_like(value, like=target)
-    if value.dtype != target.dtype:
-        value = xp.astype(value, target.dtype)
-    return value
 
 
 def _gather_rows(source, index):

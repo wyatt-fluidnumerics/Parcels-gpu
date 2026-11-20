@@ -12,13 +12,14 @@ from tqdm import tqdm
 
 from parcels._core.kernel import Kernel
 from parcels._core.particle import Particle, create_particle_data
-from parcels._core.particlesetview import ParticleSetView, _raise_if_out_of_bounds, _values_like
+from parcels._core.particlesetview import ParticleSetView
 from parcels._core.statuscodes import StatusCode
 from parcels._core.utils.array_backend import (
     array_namespace,
     asarray_like,
-    device_of,
     flatnonzero,
+    indices_to_mask,
+    values_like,
 )
 from parcels._core.utils.time import (
     TimeInterval,
@@ -195,7 +196,7 @@ class ParticleSet:
             object.__setattr__(self, name, value)
         elif isinstance(self._data, dict) and name in self._data.keys():
             if value is not self._data[name]:
-                self._data[name][...] = _values_like(value, self._data[name])
+                self._data[name][...] = values_like(value, self._data[name])
         else:
             object.__setattr__(self, name, value)
 
@@ -281,7 +282,7 @@ class ParticleSet:
             grid_positions = grid.search(self.z, self.y, self.x)
             axes = ("Z", "FACE") if isinstance(grid, UxGrid) else ("X", "Y", "Z")
             ei = grid.ravel_index({axis: grid_positions[axis]["index"] for axis in axes})
-            self._data["ei"][:, i] = _values_like(ei, self._data["ei"])
+            self._data["ei"][:, i] = values_like(ei, self._data["ei"])
 
     @classmethod
     def from_particlefile(cls, fieldset, pclass, filename, restart=True, restarttime=None, **kwargs):
@@ -494,17 +495,14 @@ class ParticleSet:
 def _particles_to_keep(indices, particle_ids):
     """Boolean mask of the particles that ``np.delete(..., indices, axis=0)`` keeps.
 
-    Built with ``isin`` because not every array library assigns through an integer index array.
+    A mask because not every array library assigns through an integer index array.
     """
     xp = array_namespace(particle_ids)
     nparticles = particle_ids.shape[0]
     indices = xp.reshape(asarray_like(indices, like=particle_ids), (-1,))
     if indices.dtype == xp.bool:
         return xp.logical_not(indices)
-    _raise_if_out_of_bounds(indices, nparticles)
-    indices = xp.where(indices < 0, indices + nparticles, indices)
-    all_indices = xp.arange(nparticles, dtype=indices.dtype, device=device_of(particle_ids))
-    return xp.logical_not(xp.isin(all_indices, indices))
+    return xp.logical_not(indices_to_mask(indices, nparticles))
 
 
 def _warn_outputdt_release_desync(outputdt: float, starttime: float, release_times: Iterable[float]):
